@@ -49,7 +49,7 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 COMPANY_NAME = "SouthlandServers"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 IPC_HOST = "127.0.0.1"
 IPC_PORT = 48572
 DEFAULT_POLL_SECONDS = 15
@@ -59,10 +59,18 @@ FAULT_TOAST_VISIBLE_MS = 18000
 ALERT_AUTO_HIDE_MS = 45000
 IMAGE_FETCH_LIMIT_BYTES = 5 * 1024 * 1024
 ALERT_FOOTER_TEXT = "Copyright \u00a9 Southland Servers Group"
+UPDATE_CHECK_SECONDS = 24 * 60 * 60
+UPDATE_RETRY_WAKE_SECONDS = 60 * 60
+UPDATE_DOWNLOAD_LIMIT_BYTES = 150 * 1024 * 1024
+GITHUB_OWNER = "vipgabe09267"
+GITHUB_REPO = "SouthlandServers_Mass_Notify_app"
+GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases?per_page=10"
+UPDATE_INSTALLER_ASSET_NAMES = ("SLS_Mass_Notify_Installer.exe",)
 
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / COMPANY_NAME / APP_SHORT_NAME
 CONFIG_PATH = CONFIG_DIR / "settings.json"
 LOG_PATH = CONFIG_DIR / "app.log"
+UPDATE_DIR = CONFIG_DIR / "updates"
 INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / COMPANY_NAME / APP_SHORT_NAME
 INSTALL_EXE_PATH = INSTALL_DIR / EXE_NAME
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -97,6 +105,7 @@ XML_KEYS = {
     "sipnotify",
     "payload",
 }
+KIND_KEYS = {"kind", "notifykind", "alertkind", "eventkind"}
 TITLE_KEYS = {"title", "eventtitle", "headline", "subject", "name"}
 EVENT_KEYS = {"event", "eventname", "alerttype", "warningtype"}
 SEVERITY_KEYS = {"severity", "level", "alertseverity"}
@@ -107,6 +116,7 @@ RECIPIENT_KEYS = {"recipients", "recipient", "phones", "extensions", "targets", 
 TIMESTAMP_KEYS = {"timestamp", "timestamps", "sentat", "createdat", "updatedat", "time", "date"}
 EVENT_ID_KEYS = {"id", "eventid", "alertid", "notifyid", "notificationid", "messageid"}
 DESCRIPTION_KEYS = {"description", "desc", "message", "body", "text"}
+BODY_KEYS = {"body", "text", "message", "description", "desc"}
 AREA_KEYS = {"area", "areas", "zone", "county", "location"}
 EFFECTIVE_KEYS = {"effective", "effectiveat", "starts", "startsat"}
 EXPIRES_KEYS = {"expires", "expiresat", "ends", "endsat"}
@@ -556,9 +566,16 @@ def active_endpoints(config: dict) -> list[tuple[int, dict]]:
 
 def default_config() -> dict:
     return {
+        "auto_update_enabled": True,
         "endpoint": "",
         "enabled": True,
         "endpoints": [blank_endpoint(index) for index in range(MAX_ENDPOINTS)],
+        "last_update_check_ts": 0.0,
+        "last_update_commit": "",
+        "last_update_error": "",
+        "last_update_release_id": "",
+        "last_update_release_name": "",
+        "last_update_release_tag": "",
         "no_token": False,
         "poll_seconds": DEFAULT_POLL_SECONDS,
         "startup_enabled": True,
@@ -633,6 +650,25 @@ def lookup(obj: object, keys: set[str]) -> object | None:
     elif isinstance(obj, list):
         for item in obj:
             found = lookup(item, keys)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def lookup_preferred(obj: object, keys: tuple[str, ...]) -> object | None:
+    if isinstance(obj, dict):
+        normalized = {normalize_key(key): value for key, value in obj.items()}
+        for key in keys:
+            value = normalized.get(normalize_key(key))
+            if value not in (None, ""):
+                return value
+        for value in obj.values():
+            found = lookup_preferred(value, keys)
+            if found not in (None, ""):
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = lookup_preferred(item, keys)
             if found not in (None, ""):
                 return found
     return None
@@ -736,6 +772,7 @@ class AlertData:
     raw: object
     raw_text: str
     source_endpoint: str
+    kind: str
     event: str
     title: str
     severity: str
@@ -748,6 +785,7 @@ class AlertData:
     area: str
     effective: str
     expires: str
+    body: str
     description: str
     recent_events: str
     event_id: str
@@ -783,21 +821,30 @@ def extract_alert(data: object, raw_text: str) -> AlertData:
         xml_payload = raw_text
 
     phone = parse_yealink_payload(xml_payload)
+    kind = safe_string(lookup(source, KIND_KEYS))
     event = safe_string(lookup(source, EVENT_KEYS))
     title = safe_string(lookup(source, TITLE_KEYS)) or phone.title
     severity = safe_string(lookup(source, SEVERITY_KEYS))
     priority = safe_string(lookup(source, PRIORITY_KEYS))
     priority_label = safe_string(lookup(source, PRIORITY_LABEL_KEYS))
-    image_url = safe_string(lookup(source, IMAGE_KEYS)) or phone.image_url
+    image_url = safe_string(lookup(source, IMAGE_KEYS))
     recipients = safe_string(lookup(source, RECIPIENT_KEYS))
     timestamp = safe_string(lookup(source, TIMESTAMP_KEYS))
     area = safe_string(lookup(source, AREA_KEYS))
     effective = safe_string(lookup(source, EFFECTIVE_KEYS))
     expires = safe_string(lookup(source, EXPIRES_KEYS))
-    description = safe_string(lookup(source, DESCRIPTION_KEYS))
+    body = safe_string(lookup_preferred(source, ("body", "description", "text", "message", "desc")))
+    description = safe_string(lookup_preferred(source, ("description", "body", "text", "message", "desc")))
     event_id = safe_string(lookup(source, EVENT_ID_KEYS))
     recent_events = format_recent_events(lookup(data, RECENT_EVENT_KEYS))
 
+    if not kind:
+        normalized_title_event = normalize_key(f"{title} {event}")
+        kind = "announcement" if "announcement" in normalized_title_event else "alert"
+    if not body:
+        body = description
+    if not description:
+        description = body
     if not title and phone.text:
         title = phone.text.splitlines()[0][:80]
     if not title:
@@ -806,6 +853,7 @@ def extract_alert(data: object, raw_text: str) -> AlertData:
     fingerprint_source = "|".join(
         [
             event_id,
+            kind,
             timestamp,
             event,
             title,
@@ -816,6 +864,7 @@ def extract_alert(data: object, raw_text: str) -> AlertData:
             area,
             effective,
             expires,
+            body,
             description,
             xml_payload,
             raw_text[:4000],
@@ -827,6 +876,7 @@ def extract_alert(data: object, raw_text: str) -> AlertData:
         raw=data,
         raw_text=raw_text,
         source_endpoint="",
+        kind=kind,
         event=event,
         title=title,
         severity=severity,
@@ -839,6 +889,7 @@ def extract_alert(data: object, raw_text: str) -> AlertData:
         area=area,
         effective=effective,
         expires=expires,
+        body=body,
         description=description,
         recent_events=recent_events,
         event_id=event_id,
@@ -937,6 +988,119 @@ def fetch_image_bytes(image_url: str) -> bytes:
     if len(data) > IMAGE_FETCH_LIMIT_BYTES:
         raise ApiError("Image response was too large")
     return data
+
+
+def fetch_latest_github_release() -> dict:
+    request = urllib.request.Request(
+        GITHUB_RELEASES_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=12) as response:
+        raw_bytes = response.read(1024 * 512)
+    data = json.loads(raw_bytes.decode("utf-8"))
+    if not isinstance(data, list):
+        raise ApiError("GitHub did not return a release list")
+
+    for release in data:
+        if not isinstance(release, dict) or release.get("draft"):
+            continue
+        assets = release.get("assets")
+        if not isinstance(assets, list):
+            continue
+        selected_asset = None
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            name = safe_string(asset.get("name"))
+            if name in UPDATE_INSTALLER_ASSET_NAMES or name.lower().endswith("_installer.exe"):
+                selected_asset = asset
+                break
+        if selected_asset is None:
+            continue
+
+        download_url = safe_string(selected_asset.get("browser_download_url"))
+        parsed = urlparse(download_url)
+        if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+            raise ApiError("Release installer asset did not provide a trusted GitHub download URL")
+
+        release_id = safe_string(release.get("id")) or safe_string(release.get("tag_name"))
+        if not release_id:
+            raise ApiError("GitHub release did not include an id or tag")
+        return {
+            "id": release_id,
+            "tag_name": safe_string(release.get("tag_name")),
+            "name": safe_string(release.get("name")) or safe_string(release.get("tag_name")),
+            "published_at": safe_string(release.get("published_at")),
+            "asset_name": safe_string(selected_asset.get("name")),
+            "asset_size": int(selected_asset.get("size") or 0),
+            "download_url": download_url,
+        }
+
+    raise ApiError("No GitHub release with SLS_Mass_Notify_Installer.exe was found")
+
+
+def download_update_installer(release: dict) -> Path:
+    release_id = safe_string(release.get("id"))
+    download_url = safe_string(release.get("download_url"))
+    asset_name = safe_string(release.get("asset_name")) or "SLS_Mass_Notify_Installer.exe"
+    parsed = urlparse(download_url)
+    if not release_id or parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+        raise ApiError("Invalid update release metadata")
+    UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+    safe_release_id = re.sub(r"[^A-Za-z0-9_.-]", "_", release_id)[:80]
+    installer_path = UPDATE_DIR / f"SLS_Mass_Notify_Installer_{safe_release_id}.exe"
+    temp_path = installer_path.with_suffix(".tmp")
+    request = urllib.request.Request(
+        download_url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        with temp_path.open("wb") as fh:
+            total = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > UPDATE_DOWNLOAD_LIMIT_BYTES:
+                    raise ApiError("Downloaded update installer was too large")
+                fh.write(chunk)
+    expected_size = int(release.get("asset_size") or 0)
+    actual_size = temp_path.stat().st_size
+    if actual_size < 5 * 1024 * 1024:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise ApiError("Downloaded update installer was unexpectedly small")
+    if expected_size and abs(actual_size - expected_size) > 4096:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise ApiError("Downloaded update installer size did not match the GitHub release asset")
+    temp_path.replace(installer_path)
+    return installer_path
+
+
+def launch_update_installer(installer_path: Path) -> None:
+    if not installer_path.exists():
+        raise ApiError(f"Update installer is missing: {installer_path}")
+    subprocess.Popen(
+        [str(installer_path), "--silent", "--update"],
+        cwd=str(installer_path.parent),
+        close_fds=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
 
 
 def play_alert_sound() -> None:
@@ -1072,8 +1236,10 @@ class AlertWindow:
             highlightthickness=0,
             bd=0,
         )
-        phone = parse_yealink_payload(self.alert.xml_payload)
-        self._draw_red_alert_screen(canvas, phone)
+        if self._is_announcement():
+            self._draw_announcement_screen(canvas)
+        else:
+            self._draw_red_alert_screen(canvas)
         return canvas
 
     def _rounded_rect(self, canvas, x1, y1, x2, y2, radius, **kwargs) -> None:
@@ -1104,6 +1270,10 @@ class AlertWindow:
             y1,
         ]
         canvas.create_polygon(points, smooth=True, **kwargs)
+
+    def _is_announcement(self) -> bool:
+        marker = normalize_key(" ".join(part for part in (self.alert.kind, self.alert.title, self.alert.event) if part))
+        return "announcement" in marker
 
     def _alert_palette(self) -> dict[str, str]:
         priority_text = " ".join(
@@ -1160,7 +1330,7 @@ class AlertWindow:
 
         return title.upper(), severity_line.upper(), area, timing
 
-    def _draw_red_alert_screen(self, canvas, phone: PhonePayload) -> None:
+    def _draw_red_alert_screen(self, canvas) -> None:
         sx, sy, sw, sh = self.SCREEN_X, self.SCREEN_Y, self.SCREEN_W, self.SCREEN_H
         palette = self._alert_palette()
         canvas.create_rectangle(sx, sy, sx + sw, sy + sh, fill=palette["outer"], outline="#050505")
@@ -1209,8 +1379,58 @@ class AlertWindow:
                 font=("Segoe UI", 17, "bold"),
             )
 
+    def _announcement_text_parts(self) -> tuple[str, str, str]:
+        title = self.alert.title or self.alert.event or "Announcement"
+        body = self.alert.body or self.alert.description or self.alert.event or "Announcement"
+        created = display_alert_time(self.alert.timestamp)
+        return title, body, created
+
+    def _draw_announcement_screen(self, canvas) -> None:
+        sx, sy, sw, sh = self.SCREEN_X, self.SCREEN_Y, self.SCREEN_W, self.SCREEN_H
+        title, body, _created = self._announcement_text_parts()
+        canvas.create_rectangle(sx, sy, sx + sw, sy + sh, fill="#f6f8fb", outline="#c6d1df")
+        canvas.create_rectangle(sx + 2, sy + 2, sx + sw - 2, sy + sh - 2, fill="#ffffff", outline="#d7e0eb")
+
+        triangle = [
+            sx + sw / 2,
+            sy + 56,
+            sx + sw / 2 - 44,
+            sy + 132,
+            sx + sw / 2 + 44,
+            sy + 132,
+        ]
+        canvas.create_polygon(triangle, fill="#f5b82e", outline="#98690a", width=3)
+        canvas.create_text(
+            sx + sw / 2,
+            sy + 104,
+            text="!",
+            fill="#332300",
+            justify="center",
+            font=("Segoe UI", 42, "bold"),
+        )
+
+        canvas.create_text(
+            sx + sw / 2,
+            sy + 182,
+            text=wrap_for_canvas(title or "Announcement", 30, 2),
+            fill="#172033",
+            justify="center",
+            width=700,
+            font=("Segoe UI", 32, "bold"),
+        )
+        canvas.create_text(
+            sx + sw / 2,
+            sy + 292,
+            text=wrap_for_canvas(body, 58, 5),
+            fill="#263447",
+            justify="center",
+            width=660,
+            font=("Segoe UI", 22),
+        )
+
     def _load_screen_image(self) -> None:
-        phone = parse_yealink_payload(self.alert.xml_payload)
+        if self._is_announcement():
+            return
         image_url = resolve_image_url(self.alert.image_url, self.alert.source_endpoint)
         if not image_url:
             return
@@ -1434,6 +1654,7 @@ class SettingsWindow:
         cfg = normalize_config(app.get_config())
         self.enabled_var = BooleanVar(value=bool(cfg.get("enabled", True)))
         self.startup_var = BooleanVar(value=is_startup_enabled() or bool(cfg.get("startup_enabled", True)))
+        self.auto_update_var = BooleanVar(value=bool(cfg.get("auto_update_enabled", True)))
         self.interval_var = IntVar(value=int(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS)))
         self.endpoint_forms: list[dict] = []
 
@@ -1453,18 +1674,27 @@ class SettingsWindow:
 
     def _configure_style(self) -> None:
         style = ttk.Style(self.window)
-        for theme in ("vista", "xpnative", "clam"):
+        for theme in ("clam", "vista", "xpnative"):
             if theme in style.theme_names():
                 try:
                     style.theme_use(theme)
                     break
                 except Exception:
                     pass
-        style.configure("Header.TLabel", font=("Segoe UI", 15, "bold"))
-        style.configure("Hint.TLabel", foreground="#555555", font=("Segoe UI", 9))
-        style.configure("Status.TLabel", foreground="#444444", font=("Segoe UI", 9))
-        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
-        style.configure("Accent.TButton", font=("Segoe UI", 9, "bold"))
+        self.window.configure(bg="#eef3f8")
+        style.configure(".", background="#eef3f8", foreground="#102033", font=("Segoe UI", 9))
+        style.configure("Surface.TFrame", background="#eef3f8")
+        style.configure("Card.TFrame", background="#ffffff", relief="flat")
+        style.configure("Header.TFrame", background="#0b5cad")
+        style.configure("Header.TLabel", background="#0b5cad", foreground="#ffffff", font=("Segoe UI", 17, "bold"))
+        style.configure("HeaderHint.TLabel", background="#0b5cad", foreground="#d9ebff", font=("Segoe UI", 9))
+        style.configure("Section.TLabel", background="#ffffff", foreground="#102033", font=("Segoe UI", 11, "bold"))
+        style.configure("Hint.TLabel", background="#ffffff", foreground="#607084", font=("Segoe UI", 9))
+        style.configure("Status.TLabel", background="#eef3f8", foreground="#445166", font=("Segoe UI", 9))
+        style.configure("TCheckbutton", background="#ffffff", foreground="#102033")
+        style.configure("TEntry", fieldbackground="#ffffff")
+        style.configure("Accent.TButton", background="#0b72df", foreground="#ffffff", font=("Segoe UI", 9, "bold"), padding=(12, 6))
+        style.map("Accent.TButton", background=[("active", "#075eb8"), ("pressed", "#054f9f")])
 
     def _build(self, cfg: dict) -> None:
         # Configure main window grid layout
@@ -1472,13 +1702,13 @@ class SettingsWindow:
         self.window.columnconfigure(0, weight=1)
         
         # Create outer container for canvas and scrollbar
-        scroll_frame = ttk.Frame(self.window)
+        scroll_frame = ttk.Frame(self.window, style="Surface.TFrame")
         scroll_frame.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
 
         # Create canvas and scrollbar
-        canvas = Canvas(scroll_frame, bg=self.window.cget("bg"), highlightthickness=0)
+        canvas = Canvas(scroll_frame, bg="#eef3f8", highlightthickness=0)
         scrollbar = ttk.Scrollbar(scroll_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas, padding=18)
+        scrollable_frame = ttk.Frame(canvas, padding=18, style="Surface.TFrame")
         
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
@@ -1520,42 +1750,65 @@ class SettingsWindow:
         canvas.bind("<Configure>", lambda e: _update_scroll_region() if e.width > 1 else None)
 
         # Build header
-        header = ttk.Frame(scrollable_frame)
-        header.pack(fill="x", pady=(0, 12))
+        header = ttk.Frame(scrollable_frame, padding=18, style="Header.TFrame")
+        header.pack(fill="x", pady=(0, 14))
         ttk.Label(header, text="SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="Configure background SIP NOTIFY monitoring, startup behavior, and up to three alert endpoints.",
-            style="Hint.TLabel",
+            text="Background alert monitoring, startup behavior, automatic updates, and up to three SIP notify endpoints.",
+            style="HeaderHint.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
-        # Build general settings
-        general = ttk.LabelFrame(scrollable_frame, text="General", padding=12)
-        general.pack(fill="x", pady=(0, 12))
+        general = ttk.Frame(scrollable_frame, padding=16, style="Card.TFrame")
+        general.pack(fill="x", pady=(0, 14))
+        ttk.Label(general, text="General", style="Section.TLabel").grid(row=0, column=0, columnspan=5, sticky="w")
+        ttk.Label(
+            general,
+            text="Choose how the background monitor runs on this Windows user profile.",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 12))
         ttk.Checkbutton(general, text="Enable background monitoring", variable=self.enabled_var).grid(
-            row=0, column=0, sticky="w", padx=(0, 18)
+            row=2, column=0, sticky="w", padx=(0, 18), pady=(0, 8)
         )
         ttk.Checkbutton(general, text="Run at Windows startup", variable=self.startup_var).grid(
-            row=0, column=1, sticky="w", padx=(0, 18)
+            row=2, column=1, sticky="w", padx=(0, 18), pady=(0, 8)
         )
-        ttk.Label(general, text="Poll every").grid(row=0, column=2, sticky="e", padx=(0, 6))
+        ttk.Checkbutton(
+            general,
+            text="Automatically check GitHub for updates once daily",
+            variable=self.auto_update_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Label(
+            general,
+            text="Updates download the installer from the latest repository commit and may request Windows admin approval.",
+            style="Hint.TLabel",
+        ).grid(row=4, column=0, columnspan=5, sticky="w", pady=(0, 10))
+        ttk.Label(general, text="Poll every", background="#ffffff").grid(row=5, column=0, sticky="w", padx=(0, 6))
         ttk.Spinbox(general, from_=5, to=3600, textvariable=self.interval_var, width=7).grid(
-            row=0, column=3, sticky="w"
+            row=5, column=1, sticky="w"
         )
-        ttk.Label(general, text="seconds").grid(row=0, column=4, sticky="w", padx=(6, 0))
+        ttk.Label(general, text="seconds", background="#ffffff").grid(row=5, column=2, sticky="w", padx=(6, 0))
         general.columnconfigure(5, weight=1)
 
-        # Build endpoints
-        endpoints_frame = ttk.LabelFrame(scrollable_frame, text="Alert Endpoints", padding=12)
+        endpoints_frame = ttk.Frame(scrollable_frame, padding=16, style="Card.TFrame")
         endpoints_frame.pack(fill="both", expand=True, pady=(0, 12))
+        ttk.Label(endpoints_frame, text="Alert Endpoints", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(
+            endpoints_frame,
+            text="Each active endpoint may use its own bearer token, or No token mode for trusted direct endpoints.",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(2, 12))
         for index, endpoint in enumerate(normalize_endpoints(cfg)):
-            group = ttk.LabelFrame(endpoints_frame, text=f"Endpoint {index + 1}", padding=10)
-            group.pack(fill="x", pady=(0, 10 if index < MAX_ENDPOINTS - 1 else 0))
+            group = ttk.Frame(endpoints_frame, padding=12, style="Card.TFrame")
+            group.pack(fill="x", pady=(0, 12 if index < MAX_ENDPOINTS - 1 else 0))
+            ttk.Label(group, text=f"Endpoint {index + 1}", style="Section.TLabel").grid(
+                row=0, column=0, columnspan=3, sticky="w", pady=(0, 8)
+            )
             self._build_endpoint_tab(group, index, endpoint)
 
         # Footer stays at bottom with separator
         ttk.Separator(self.window).grid(row=1, column=0, sticky="ew", pady=(2, 0))
-        footer = ttk.Frame(self.window)
+        footer = ttk.Frame(self.window, padding=(2, 0), style="Surface.TFrame")
         footer.grid(row=2, column=0, sticky="ew", padx=12, pady=8)
         footer.columnconfigure(0, weight=1)  # Status expands
         
@@ -1589,39 +1842,44 @@ class SettingsWindow:
         }
         self.endpoint_forms.append(form)
 
-        ttk.Checkbutton(parent, text="Enabled", variable=form["enabled"]).grid(row=0, column=0, sticky="w")
+        row_offset = 1
+        ttk.Checkbutton(parent, text="Enabled", variable=form["enabled"]).grid(row=row_offset, column=0, sticky="w")
         ttk.Checkbutton(
             parent,
             text="No token",
             variable=form["no_token"],
             command=lambda idx=index: self.toggle_no_token(idx),
-        ).grid(row=0, column=1, sticky="w", padx=(18, 0))
+        ).grid(row=row_offset, column=1, sticky="w", padx=(18, 0))
         ttk.Checkbutton(
             parent,
             text="Show token",
             variable=form["show_token"],
             command=lambda idx=index: self.toggle_token(idx),
-        ).grid(row=0, column=2, sticky="w", padx=(18, 0))
+        ).grid(row=row_offset, column=2, sticky="w", padx=(18, 0))
 
-        ttk.Label(parent, text="Name").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(parent, text="Name", background="#ffffff").grid(row=row_offset + 1, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(parent, textvariable=form["name"], width=24).grid(
-            row=2, column=0, sticky="ew", pady=(3, 0), padx=(0, 10)
+            row=row_offset + 2, column=0, sticky="ew", pady=(3, 0), padx=(0, 10)
         )
 
-        ttk.Label(parent, text="Endpoint URL").grid(row=1, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(parent, text="Endpoint URL", background="#ffffff").grid(
+            row=row_offset + 1, column=1, columnspan=2, sticky="w", pady=(10, 0)
+        )
         ttk.Entry(parent, textvariable=form["endpoint"], width=64).grid(
-            row=2, column=1, columnspan=2, sticky="ew", pady=(3, 0), padx=(0, 10)
+            row=row_offset + 2, column=1, columnspan=2, sticky="ew", pady=(3, 0), padx=(0, 10)
         )
 
-        ttk.Label(parent, text="Authorization token / key").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(parent, text="Authorization token / key", background="#ffffff").grid(
+            row=row_offset + 3, column=0, sticky="w", pady=(10, 0)
+        )
         token_entry = ttk.Entry(parent, textvariable=form["token"], width=80, show="*")
-        token_entry.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(3, 0), padx=(0, 10))
+        token_entry.grid(row=row_offset + 4, column=0, columnspan=3, sticky="ew", pady=(3, 0), padx=(0, 10))
         form["token_entry"] = token_entry
         ttk.Label(
             parent,
             text="No token calls this endpoint directly without an Authorization header.",
             style="Hint.TLabel",
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=row_offset + 5, column=0, columnspan=3, sticky="w", pady=(8, 0))
         parent.columnconfigure(0, weight=1)
         parent.columnconfigure(1, weight=2)
         parent.columnconfigure(2, weight=2)
@@ -1705,6 +1963,7 @@ class SettingsWindow:
             endpoints=endpoints,
             enabled=self.enabled_var.get(),
             startup_enabled=self.startup_var.get(),
+            auto_update_enabled=self.auto_update_var.get(),
             poll_seconds=interval,
         )
         self.status_label.configure(text="Saved. Monitoring will use the active endpoint tabs.")
@@ -1751,6 +2010,9 @@ class MassNotifyApp:
         self.poll_thread = threading.Thread(target=self.poll_loop, name="EndpointPoller", daemon=True)
         self.poll_thread.start()
 
+        self.update_thread = threading.Thread(target=self.update_loop, name="AutoUpdater", daemon=True)
+        self.update_thread.start()
+
         self.root.after(200, self.process_ui_queue)
 
         if show_settings_on_start or not self.is_configured():
@@ -1777,6 +2039,7 @@ class MassNotifyApp:
         endpoints: list[dict],
         enabled: bool,
         startup_enabled: bool,
+        auto_update_enabled: bool,
         poll_seconds: int,
     ) -> None:
         with self.config_lock:
@@ -1790,6 +2053,7 @@ class MassNotifyApp:
             self.config["last_fingerprint"] = first.get("last_fingerprint", "")
             self.config["enabled"] = bool(enabled)
             self.config["startup_enabled"] = bool(startup_enabled)
+            self.config["auto_update_enabled"] = bool(auto_update_enabled)
             self.config["poll_seconds"] = int(poll_seconds)
             self.config = normalize_config(self.config)
             save_config(self.config)
@@ -1908,6 +2172,75 @@ class MassNotifyApp:
 
             self.wakeup_event.wait(interval)
             self.wakeup_event.clear()
+
+    def update_loop(self) -> None:
+        if self.stop_event.wait(45):
+            return
+        while not self.stop_event.is_set():
+            try:
+                self.check_for_updates_if_due()
+            except Exception as exc:
+                log(f"auto update loop failed: {exc}")
+            if self.stop_event.wait(UPDATE_RETRY_WAKE_SECONDS):
+                break
+
+    def check_for_updates_if_due(self) -> None:
+        with self.config_lock:
+            cfg = normalize_config(dict(self.config))
+        if not bool(cfg.get("auto_update_enabled", True)):
+            return
+
+        now = time.time()
+        last_check = float(cfg.get("last_update_check_ts", 0) or 0)
+        if now - last_check < UPDATE_CHECK_SECONDS:
+            return
+
+        with self.config_lock:
+            self.config["last_update_check_ts"] = now
+            self.config["last_update_error"] = ""
+            self.config = normalize_config(self.config)
+            save_config(self.config)
+
+        try:
+            latest_release = fetch_latest_github_release()
+            release_id = safe_string(latest_release.get("id"))
+            release_name = safe_string(latest_release.get("name")) or safe_string(latest_release.get("tag_name"))
+            with self.config_lock:
+                current_release_id = safe_string(self.config.get("last_update_release_id"))
+                if not current_release_id:
+                    current_release_id = safe_string(self.config.get("last_update_commit"))
+            if not current_release_id:
+                with self.config_lock:
+                    self.config["last_update_release_id"] = release_id
+                    self.config["last_update_release_name"] = release_name
+                    self.config["last_update_release_tag"] = safe_string(latest_release.get("tag_name"))
+                    self.config["last_update_error"] = ""
+                    self.config = normalize_config(self.config)
+                    save_config(self.config)
+                log(f"auto update baseline set to GitHub release {release_name or release_id}")
+                return
+            if release_id == current_release_id:
+                log(f"auto update check OK: already at tracked release {release_name or release_id}")
+                return
+
+            log(f"auto update found release {release_name or release_id}; downloading installer")
+            installer_path = download_update_installer(latest_release)
+            with self.config_lock:
+                self.config["last_update_release_id"] = release_id
+                self.config["last_update_release_name"] = release_name
+                self.config["last_update_release_tag"] = safe_string(latest_release.get("tag_name"))
+                self.config["last_update_error"] = ""
+                self.config = normalize_config(self.config)
+                save_config(self.config)
+            log(f"launching update installer: {installer_path}")
+            launch_update_installer(installer_path)
+        except Exception as exc:
+            message = safe_string(exc)
+            with self.config_lock:
+                self.config["last_update_error"] = message
+                self.config = normalize_config(self.config)
+                save_config(self.config)
+            log(f"auto update check failed: {message}")
 
     def process_ui_queue(self) -> None:
         while True:

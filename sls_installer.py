@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import shutil
 import subprocess
@@ -23,7 +24,7 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 INSTALLER_EXE_NAME = "SLS_Mass_Notify_Uninstall.exe"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 UNINSTALL_REG_PATH = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_SHORT_NAME}"
 
@@ -38,6 +39,7 @@ START_MENU_DIR = (
     / COMPANY_DISPLAY_NAME
 )
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "SouthlandServers" / APP_SHORT_NAME
+CONFIG_PATH = CONFIG_DIR / "settings.json"
 LEGACY_INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "SouthlandServers" / APP_SHORT_NAME
 LEGACY_START_MENU_DIR = (
     Path(os.environ.get("APPDATA", Path.home()))
@@ -228,12 +230,33 @@ def remove_uninstall_registry() -> None:
         pass
 
 
+def write_auto_update_preference(enabled: bool | None, progress: ProgressCallback | None = None) -> None:
+    if enabled is None:
+        return
+    emit(progress, "Saving automatic update preference.")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    config: dict = {}
+    try:
+        if CONFIG_PATH.exists():
+            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config = loaded
+    except (OSError, json.JSONDecodeError):
+        config = {}
+    config["auto_update_enabled"] = bool(enabled)
+    temp_path = CONFIG_PATH.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    temp_path.replace(CONFIG_PATH)
+
+
 def install_app(
     install_dir: Path,
     *,
     startup: bool,
     launch: bool,
     remove_legacy: bool,
+    auto_update: bool | None,
+    launch_background: bool = False,
     progress: ProgressCallback | None = None,
 ) -> None:
     app_payload = resource_path(EXE_NAME)
@@ -273,12 +296,14 @@ def install_app(
 
     emit(progress, "Configuring Windows startup setting.")
     set_startup_enabled(startup, app_path)
+    write_auto_update_preference(auto_update, progress)
     write_uninstall_registry(install_dir, progress)
 
     if launch:
-        emit(progress, "Opening settings after install.")
+        emit(progress, "Starting SLS Mass Notify.")
+        launch_args = [str(app_path), "--background"] if launch_background else [str(app_path)]
         subprocess.Popen(
-            [str(app_path)],
+            launch_args,
             cwd=str(install_dir),
             close_fds=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -378,6 +403,7 @@ class InstallerWindow:
         self.install_dir = StringVar(value=str(DEFAULT_INSTALL_DIR))
         self.startup = BooleanVar(value=True)
         self.launch = BooleanVar(value=True)
+        self.auto_update = BooleanVar(value=True)
         self.status = StringVar(value="Ready to install.")
         self.install_button: ttk.Button | None = None
         self.cancel_button: ttk.Button | None = None
@@ -410,20 +436,25 @@ class InstallerWindow:
         ttk.Checkbutton(frame, text="Open settings after install", variable=self.launch).grid(
             row=5, column=0, columnspan=3, sticky="w", pady=(0, 6)
         )
+        ttk.Checkbutton(
+            frame,
+            text="Automatically check GitHub for updates once every 24 hours",
+            variable=self.auto_update,
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
         self.progressbar = ttk.Progressbar(frame, mode="indeterminate")
-        self.progressbar.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 8))
+        self.progressbar.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 8))
         self.log_box = Text(frame, width=86, height=8, wrap="word", state="disabled")
-        self.log_box.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+        self.log_box.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(0, 14))
 
-        ttk.Separator(frame).grid(row=8, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        ttk.Separator(frame).grid(row=9, column=0, columnspan=3, sticky="ew", pady=(0, 12))
         ttk.Label(frame, textvariable=self.status, foreground="#444444").grid(
-            row=9, column=0, sticky="w"
+            row=10, column=0, sticky="w"
         )
         self.cancel_button = ttk.Button(frame, text="Cancel", command=self.root.destroy)
-        self.cancel_button.grid(row=9, column=1, sticky="e", padx=(0, 8))
+        self.cancel_button.grid(row=10, column=1, sticky="e", padx=(0, 8))
         self.install_button = ttk.Button(frame, text="Install", command=self.install)
-        self.install_button.grid(row=9, column=2, sticky="e")
+        self.install_button.grid(row=10, column=2, sticky="e")
 
     def log(self, message: str) -> None:
         self.status.set(message)
@@ -463,6 +494,8 @@ class InstallerWindow:
                 startup=self.startup.get(),
                 launch=self.launch.get(),
                 remove_legacy=True,
+                auto_update=self.auto_update.get(),
+                launch_background=False,
                 progress=self.log,
             )
             if self.progressbar is not None:
@@ -603,7 +636,14 @@ def main() -> None:
     if "--silent" in sys.argv:
         if not is_admin() and relaunch_as_admin():
             return
-        install_app(DEFAULT_INSTALL_DIR, startup=True, launch=True, remove_legacy=True)
+        install_app(
+            DEFAULT_INSTALL_DIR,
+            startup=True,
+            launch=True,
+            remove_legacy=True,
+            auto_update=None,
+            launch_background="--update" in sys.argv,
+        )
         return
 
     if not is_admin():
