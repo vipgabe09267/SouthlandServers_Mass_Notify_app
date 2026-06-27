@@ -1,86 +1,250 @@
 # SouthlandServers Mass Notification App
 
-Current version: 1.0.1
+**Current version: V1.0.1**
 
-SouthlandServers Mass Notification App is an open-source Windows desktop client for SIP NOTIFY/EAS-style alert delivery. It runs quietly in the background, polls one or more HTTPS alert endpoints, displays weather alerts in a Yealink T48G-style screen preview, and displays mass announcements in a simplified safe-format notice.
+[![Windows](https://img.shields.io/badge/platform-Windows-0A66C2)](#install)
+[![Python](https://img.shields.io/badge/built%20with-Python-3776AB)](#build-from-source)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue)](LICENSE)
+[![Southland Servers](https://img.shields.io/badge/Southland%20Servers-Projects-111827)](https://southlandservers.xyz/projects)
 
-The app is designed for dispatch, weather alerting, emergency notification demos, PBX visual alert workflows, and other environments where a lightweight Windows companion app needs to mirror alert content being pushed to SIP phones.
+SouthlandServers Mass Notification App is an open-source Windows desktop companion for SIP NOTIFY, emergency alert, PBX announcement, and EAS-style visual notification workflows.
 
-## Project Status
+It runs quietly in the background, starts with Windows if enabled, polls one or more HTTPS endpoints, plays the bundled EAS tone for new events, and displays clean desktop alert windows without requiring users to keep a browser open.
 
-This app is functional and suitable for controlled testing, demos, and pilot deployments. Before calling it fully production-ready, recommended hardening includes code signing, installer signing, CI builds, automated endpoint tests, crash reporting/log rotation, and a real release/update process.
+[View Southland Servers Projects](https://southlandservers.xyz/projects)
 
-## Features
+![SouthlandServers Mass Notification App preview](SLS_Mass_Notif_App.png)
 
-- Native Windows `.exe` built with Python and PyInstaller.
-- Runs in the background and starts automatically with Windows.
-- Adds Start Menu launch/uninstall shortcuts and a Windows Installed Apps uninstall entry.
-- Supports up to three independent HTTPS alert endpoints.
-- Each endpoint can use its own bearer token/key, or run in `No token` mode.
-- Stores local tokens encrypted with Windows DPAPI.
-- Optional automatic updates from GitHub, checked once every 24 hours.
-- Polls every 10-30 seconds by default, configurable in settings.
-- Tracks each endpoint's latest alert ID to avoid duplicate notifications.
-- Displays new alerts in an 800x480 Yealink T48G-style screen window.
-- Displays `kind: announcement` events as a simplified safe-format notice with a hazard icon, title, and body.
-- Shows API-provided alert title, priority/severity, area, effective time, and until/expires time on the alert screen.
-- Maps `critical` alerts to red, `urgent` alerts to orange, and `advisory`/`notice` alerts to yellow.
-- Shows an API-provided alert image payload full-screen when available.
-- Plays the bundled EAS tone once for each new alert.
-- Reports unresolved endpoint/token/system faults after five minutes.
-- Includes an uninstall flow that removes startup entries, shortcuts, app files, and saved settings.
+## What It Does
+
+| Area | Behavior |
+| --- | --- |
+| Weather alerts | Shows NWS/SIP NOTIFY-style alert screens with title, priority, severity, area, effective time, and until/expires time. |
+| Announcements | Shows a simplified safe-format notice with a hazard icon, title, and body only. |
+| Endpoints | Supports up to three independent HTTPS endpoints. |
+| Tokens | Supports bearer tokens per endpoint, plus a `No token` mode for trusted direct endpoints. |
+| Startup | Can register itself to run automatically when Windows starts. |
+| Updates | Optional automatic update checks from GitHub Releases once every 24 hours. |
+| Faults | Shows a desktop fault notification if an endpoint, token, or system issue remains unresolved for five minutes. |
+| Uninstall | Adds a normal Windows uninstall entry and Start Menu uninstall shortcut. |
+
+## Screens And Event Types
+
+### Weather / NWS Alerts
+
+Weather alerts use the structured weather fields returned by the API:
+
+- `latest.title`
+- `latest.priority`
+- `latest.priority_label`
+- `latest.severity`
+- `latest.area`
+- `latest.effective`
+- `latest.expires`
+- `latest.description`
+- `latest.image_url`
+
+Priority colors:
+
+| Priority | Display Color |
+| --- | --- |
+| `critical` | Red |
+| `urgent` | Orange |
+| `advisory` / `notice` | Yellow |
+
+### Mass Notify Announcements
+
+Announcements use `latest.kind: "announcement"` and display only:
+
+- hazard triangle/exclamation symbol
+- title
+- body text
+
+The announcement window intentionally does not display endpoint internals, XML internals, IP addresses, recipients, or fake phone controls.
+
+## Install
+
+Download the latest V1.0.1 installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
+
+```text
+SLS_Mass_Notify_Installer.exe
+```
+
+Run the installer as Administrator. The installer will:
+
+1. Install the app into:
+
+   ```text
+   C:\Program Files\Southland Servers Group\SLS Mass Notify
+   ```
+
+2. Add Start Menu shortcuts under:
+
+   ```text
+   Southland Servers Group
+   ```
+
+3. Add a Windows Installed Apps uninstall entry.
+4. Ask whether the app should run at Windows startup.
+5. Ask whether automatic GitHub update checks should be enabled.
+6. Launch the Settings window after install.
+
+Windows SmartScreen may warn on unsigned builds. Code signing is recommended before broad public deployment.
+
+## First Run Setup
+
+When Settings opens, configure at least one endpoint.
+
+1. Enable the endpoint tab you want to use.
+2. Enter the HTTPS endpoint URL.
+3. Enter the bearer token/key, or check `No token` if the endpoint is designed to be called directly.
+4. Choose the poll interval.
+5. Click `Test Active Endpoints`.
+6. Click `Save`.
+
+The app can monitor up to three endpoints at the same time. Each endpoint can have a different URL, token, enabled state, and no-token setting.
 
 ## How It Works
 
-The app polls configured endpoints with a normal HTTPS `GET` request. When a token/key is configured, it sends:
+The background app polls each enabled endpoint on a timer.
 
-```text
-Authorization: Bearer <token>
+```mermaid
+flowchart LR
+    A[Windows Startup] --> B[SLS Mass Notify Background App]
+    B --> C[Load Settings]
+    C --> D[Poll HTTPS Endpoints]
+    D --> E{New latest.id?}
+    E -- No --> D
+    E -- Yes --> F[Play eas_tone.wav once]
+    F --> G{kind}
+    G -- alert --> H[Show Weather Alert Screen]
+    G -- announcement --> I[Show Safe Announcement Notice]
+    D --> J{Fault unresolved 5 min?}
+    J -- Yes --> K[Desktop Fault Notification]
 ```
 
-When `No token` is checked for an endpoint, the app sends no `Authorization` header for that endpoint.
+For token-protected endpoints, the app sends a normal HTTPS `GET` request:
 
-Configured API endpoints must use `https://`; `http://` is accepted only for `localhost`/loopback development testing.
+```http
+GET /api/sipnotify?limit=25 HTTP/1.1
+Host: example.com
+Authorization: Bearer TOKENHERE
+```
 
-Expected API shape:
+If `No token` is checked, the app calls the endpoint without the `Authorization` header.
+
+The app stores the last seen `latest.id` for each endpoint. A notification appears only when that ID changes. If an endpoint does not provide an ID, the app falls back to a content fingerprint.
+
+## Expected API Format
+
+### Weather Alert Example
 
 ```json
 {
   "ok": true,
   "latest": {
-    "id": "desktop-api-verification-...",
-    "event": "Severe Thunderstorm Warning",
-    "title": "SVR TSTORM WARNING",
-    "priority": "urgent",
-    "priority_label": "URGENT",
-    "severity": "Severe",
+    "kind": "alert",
+    "id": "urn:oid:...",
+    "event": "Tornado Warning",
+    "title": "TORNADO WARNING",
+    "priority": "critical",
+    "priority_label": "CRITICAL",
+    "severity": "Extreme",
+    "message_type": "Alert",
     "area": "Williamson County TX",
-    "description": "...",
-    "image_url": "https://example.com/nws_visual_push/alert.png",
+    "effective": "2026-06-21T08:27:32-05:00",
+    "expires": "2026-06-21T09:12:32-05:00",
+    "description": "The National Weather Service has issued...",
+    "image_url": "https://example.com/nws_visual_push/alert_xxx.png",
     "xml": "<YealinkIPPhoneImageScreen ...>",
-    "created_at": "..."
+    "recipients": ["1000"],
+    "created_at": "2026-06-21T08:27:32-05:00"
   },
   "events": []
 }
 ```
 
-For each endpoint, the app stores the last seen `latest.id`. A notification appears only when that ID changes. If no ID exists, the app falls back to a content fingerprint.
+### Announcement Example
 
-Announcement payloads use `latest.kind`, `latest.title`, `latest.priority`, `latest.priority_label`, `latest.body` or `latest.description`, `latest.image_url`, and `latest.created_at`. Weather alerts continue to use the weather fields such as `latest.severity`, `latest.area`, `latest.effective`, and `latest.expires`.
+```json
+{
+  "ok": true,
+  "latest": {
+    "kind": "announcement",
+    "id": "announcement-20260621182234",
+    "event": "Announcement",
+    "title": "Announcement",
+    "priority": "notice",
+    "priority_label": "ADVISORY",
+    "beep": "yes",
+    "body": "Mass notify body verification test 2",
+    "text": "Mass notify body verification test 2",
+    "description": "Mass notify body verification test 2",
+    "message": "Mass notify body verification test 2",
+    "image_url": "",
+    "xml": "<YealinkIPPhoneTextScreen Beep='yes'>...</YealinkIPPhoneTextScreen>",
+    "recipients": [],
+    "created_at": "2026-06-21T13:22:34.632063-05:00"
+  },
+  "events": []
+}
+```
+
+## Security Notes
+
+- Endpoint URLs should use `https://`.
+- `http://` is accepted only for localhost or loopback development testing.
+- Local tokens are encrypted with Windows DPAPI before being saved.
+- Settings are stored under:
+
+  ```text
+  %APPDATA%\SouthlandServers\SLS_Mass_Notify\settings.json
+  ```
+
+- The exact XML payload remains available from the raw XML view, but the normal visible alert screens are driven by clean API fields.
+- Server-side token storage at `/etc/nws_sipnotify_api.token`, 401 handling, Apache routing, and 256-bit token generation remain server responsibilities.
 
 ## Automatic Updates
 
-Automatic updates are optional. When enabled, the app checks the GitHub repository once every 24 hours:
+Automatic updates are optional.
+
+When enabled, the app checks this GitHub repository once every 24 hours:
 
 ```text
 vipgabe09267/SouthlandServers_Mass_Notify_app
 ```
 
-On first check, the app records the current latest GitHub Release as its baseline. On later checks, if a newer non-draft release exists, the app downloads the `SLS_Mass_Notify_Installer.exe` release asset and runs it in update mode. Windows may request administrator approval because replacing files in Program Files requires elevation.
+The updater watches GitHub Releases. When a newer published, non-draft release is available, the app downloads the release asset named:
 
-For update clients to install a new release, that release must include a rebuilt `SLS_Mass_Notify_Installer.exe` asset. Prereleases are eligible as long as they are published and not drafts.
+```text
+SLS_Mass_Notify_Installer.exe
+```
 
-## Build
+Then it runs that installer in update mode. Because the app installs into Program Files, Windows may request administrator approval during updates.
+
+## Uninstall
+
+Use either method:
+
+```text
+Start Menu > Southland Servers Group > Uninstall SouthlandServers Mass Notification App
+```
+
+or:
+
+```text
+Windows Settings > Apps > Installed Apps
+```
+
+The uninstaller removes startup entries, Start Menu shortcuts, installed app files, and optionally saved endpoint settings/tokens.
+
+## Build From Source
+
+Install build requirements:
+
+```powershell
+py -m pip install -r requirements-build.txt
+```
 
 Build the standalone background app:
 
@@ -88,7 +252,7 @@ Build the standalone background app:
 .\build.ps1 -Clean
 ```
 
-The finished app is created at:
+Output:
 
 ```text
 dist\SLS_Mass_Notify.exe
@@ -100,45 +264,36 @@ Build the installable setup app:
 .\build-installer.ps1 -Clean
 ```
 
-The finished installer is created at:
+Output:
 
 ```text
 dist\SLS_Mass_Notify_Installer.exe
 ```
 
-## Behavior
+## Release Checklist
 
-- The installer requests Administrator permission and installs to `%ProgramFiles%\Southland Servers Group\SLS Mass Notify`.
-- The installer can register the app under the current user's Windows startup registry key.
-- The installer shows each install step and opens the Settings window after install.
-- The installer lets the user opt out of automatic GitHub update checks.
-- It adds Start Menu shortcuts under `Southland Servers Group` for launching and uninstalling.
-- It adds a Windows Installed Apps uninstall entry.
-- First run asks for endpoint settings. Up to three endpoints can be configured.
-- Each endpoint can use its own token/key, or can be marked `No token` to call the URL directly.
-- The token is stored in `%APPDATA%\SouthlandServers\SLS_Mass_Notify\settings.json` encrypted with Windows DPAPI.
-- Opening the app again while it is running brings up settings.
-- When a new alert fingerprint is seen, it plays `eas_tone.wav` once and shows the appropriate alert or announcement preview.
-- The alert preview is non-modal, drops out of topmost mode, auto-hides, and lowers behind your active window when focus leaves it.
-- If the same endpoint/token/system fault remains unresolved for 5 minutes, the app shows a small desktop fault notification.
-- The preview resolves missing-host image URLs such as `http:///nws_visual_push/...` against the configured endpoint host and displays the returned image on the simulated T48G screen when possible.
+Before publishing a release:
 
-## Uninstall
+1. Confirm `APP_VERSION` is still `1.0.1` for this V1.0.1 release.
+2. Rebuild with `.\build-installer.ps1 -Clean`.
+3. Test install, settings save, endpoint test, background startup, alert display, announcement display, uninstall, and update preference.
+4. Attach `dist\SLS_Mass_Notify_Installer.exe` to the GitHub Release.
+5. Code sign the app and installer when a signing certificate is available.
 
-Use either:
+## Project Status
 
-```text
-Start Menu > Southland Servers Group > Uninstall SouthlandServers Mass Notification App
-```
+V1.0.1 is suitable for controlled testing, demos, pilots, and small trusted deployments.
 
-or Windows Settings > Apps > Installed Apps. Uninstall shows a confirmation/progress window, then removes the startup entry, Start Menu shortcuts, installed app folder, and saved settings if selected.
+Recommended hardening before broad public production rollout:
 
-## Endpoint Details
+- code signing and installer signing
+- CI-based release builds
+- automated endpoint integration tests
+- crash reporting or stronger log rotation
+- signed update verification
 
-The endpoint can return JSON, XML, or plain text. For the SIP NOTIFY API shape, it reads `latest.id`, `latest.kind`, `latest.title`, `latest.event`, `latest.severity`, `latest.priority`, `latest.priority_label`, `latest.body`, `latest.image_url`, `latest.xml`, `latest.description`, `latest.area`, `latest.effective`, `latest.expires`, `latest.created_at`, and `events`. It stores the last seen `latest.id` and only shows a new notification when that ID changes. Visible screens are driven by clean API fields; announcement screens show only the hazard icon, title, and body, while exact XML remains available from the raw XML view.
+## License
 
-Server-side token storage at `/etc/nws_sipnotify_api.token`, 401 handling, Apache routing, and 256-bit token generation remain server responsibilities. This Windows client keeps its local copy private with DPAPI.
+This project is open source under the [GNU General Public License v3.0](LICENSE).
 
-## Open Source
-
-This project is open source under the GNU General Public License v3.0. Contributions, forks, audits, and integrations are welcome under the same copyleft license terms.
+Contributions, forks, audits, and integrations are welcome under the same copyleft license terms.
