@@ -32,7 +32,7 @@ $env:TK_LIBRARY = Join-Path $PythonBase "tcl\tk8.6"
     --icon "$ProjectRoot\favicon.ico" `
     --add-data "$ProjectRoot\icon.png;." `
     --add-data "$ProjectRoot\favicon.ico;." `
-    --add-data "$ProjectRoot\eas_tone.wav;." `
+    --add-data "$ProjectRoot\audio;audio" `
     "$ProjectRoot\sls_mass_notify.py"
 
 if ($LASTEXITCODE -ne 0) {

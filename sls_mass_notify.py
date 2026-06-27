@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tkinter import BooleanVar, Canvas, IntVar, StringVar, Text, Tk, Toplevel, messagebox
+from tkinter import BooleanVar, Canvas, IntVar, StringVar, Text, Tk, Toplevel, filedialog, messagebox
 from tkinter import ttk
 
 try:
@@ -49,7 +49,7 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 COMPANY_NAME = "SouthlandServers"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.3"
 IPC_HOST = "127.0.0.1"
 IPC_PORT = 48572
 DEFAULT_POLL_SECONDS = 15
@@ -59,9 +59,12 @@ FAULT_TOAST_VISIBLE_MS = 18000
 ALERT_AUTO_HIDE_MS = 45000
 IMAGE_FETCH_LIMIT_BYTES = 5 * 1024 * 1024
 ALERT_FOOTER_TEXT = "Copyright \u00a9 Southland Servers Group"
-UPDATE_CHECK_SECONDS = 24 * 60 * 60
-UPDATE_RETRY_WAKE_SECONDS = 60 * 60
+UPDATE_CHECK_SECONDS = 15 * 60
+UPDATE_RETRY_WAKE_SECONDS = 5 * 60
 UPDATE_DOWNLOAD_LIMIT_BYTES = 150 * 1024 * 1024
+AUDIO_DIR_NAME = "audio"
+DEFAULT_AUDIO_NAME = "Announcement.wav"
+MAX_CUSTOM_AUDIO_BYTES = 25 * 1024 * 1024
 GITHUB_OWNER = "vipgabe09267"
 GITHUB_REPO = "SouthlandServers_Mass_Notify_app"
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases?per_page=10"
@@ -71,6 +74,7 @@ CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / COMPANY_NAME / APP_S
 CONFIG_PATH = CONFIG_DIR / "settings.json"
 LOG_PATH = CONFIG_DIR / "app.log"
 UPDATE_DIR = CONFIG_DIR / "updates"
+USER_AUDIO_DIR = CONFIG_DIR / AUDIO_DIR_NAME
 INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / COMPANY_NAME / APP_SHORT_NAME
 INSTALL_EXE_PATH = INSTALL_DIR / EXE_NAME
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -134,7 +138,14 @@ LATEST_OBJECT_KEYS = {
 
 def resource_path(name: str) -> Path:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    return base / name
+    bundled = base / name
+    if bundled.exists():
+        return bundled
+    if getattr(sys, "frozen", False):
+        sibling = Path(sys.executable).resolve().parent / name
+        if sibling.exists():
+            return sibling
+    return Path(__file__).resolve().parent / name
 
 
 def app_command(background: bool = True) -> str:
@@ -527,6 +538,7 @@ def normalize_config(config: dict) -> dict:
     normalized["no_token"] = bool(first.get("no_token", False))
     normalized["last_event_id"] = first.get("last_event_id", "")
     normalized["last_fingerprint"] = first.get("last_fingerprint", "")
+    normalized["audio_sound"] = safe_audio_name(safe_string(normalized.get("audio_sound")) or DEFAULT_AUDIO_NAME)
     return normalized
 
 
@@ -548,11 +560,95 @@ def endpoint_display_name(index: int, endpoint: dict) -> str:
 
 def endpoint_url_allowed(url: str) -> bool:
     parsed = urlparse(url)
-    if parsed.scheme == "https" and parsed.netloc:
-        return True
-    if parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
         return True
     return False
+
+
+def endpoint_security_warnings(url: str, no_token: bool) -> list[tuple[str, str]]:
+    warnings: list[tuple[str, str]] = []
+    parsed = urlparse(safe_string(url))
+    if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        warnings.append(
+            (
+                "red",
+                "Warning: this HTTP endpoint may be vulnerable to man-in-the-middle attacks. Use HTTPS when possible.",
+            )
+        )
+    if no_token:
+        warnings.append(
+            (
+                "yellow",
+                "Caution: this endpoint is not using a token, so requests may not be fully authenticated.",
+            )
+        )
+    return warnings
+
+
+def audio_search_dirs() -> list[Path]:
+    dirs = [
+        USER_AUDIO_DIR,
+        resource_path(AUDIO_DIR_NAME),
+        Path(__file__).resolve().parent / AUDIO_DIR_NAME,
+    ]
+    if getattr(sys, "frozen", False):
+        dirs.insert(1, Path(sys.executable).resolve().parent / AUDIO_DIR_NAME)
+    result: list[Path] = []
+    seen: set[str] = set()
+    for directory in dirs:
+        try:
+            key = str(directory.resolve()).lower()
+        except OSError:
+            key = str(directory).lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(directory)
+    return result
+
+
+def safe_audio_name(name: str) -> str:
+    candidate = Path(safe_string(name)).name
+    if Path(candidate).suffix.lower() != ".wav":
+        return DEFAULT_AUDIO_NAME
+    return candidate
+
+
+def list_audio_choices() -> list[str]:
+    choices: dict[str, Path] = {}
+    for directory in audio_search_dirs():
+        if not directory.exists() or not directory.is_dir():
+            continue
+        for path in directory.glob("*.wav"):
+            if path.is_file():
+                choices.setdefault(path.name, path)
+    names = sorted(choices.keys(), key=str.lower)
+    if DEFAULT_AUDIO_NAME in names:
+        names.remove(DEFAULT_AUDIO_NAME)
+    return [DEFAULT_AUDIO_NAME] + names if DEFAULT_AUDIO_NAME in choices else names
+
+
+def find_audio_file(name: str) -> Path | None:
+    filename = safe_audio_name(name)
+    for directory in audio_search_dirs():
+        candidate = directory / filename
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def import_custom_audio(source: Path) -> str:
+    source = source.resolve()
+    if source.suffix.lower() != ".wav":
+        raise ValueError("Only .wav audio files are supported.")
+    if not source.is_file():
+        raise FileNotFoundError(f"Audio file does not exist: {source}")
+    if source.stat().st_size > MAX_CUSTOM_AUDIO_BYTES:
+        raise ValueError("Audio file is too large. Use a WAV file under 25 MB.")
+    USER_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    destination = USER_AUDIO_DIR / source.name
+    if source != destination:
+        shutil.copy2(source, destination)
+    return destination.name
 
 
 def active_endpoints(config: dict) -> list[tuple[int, dict]]:
@@ -567,6 +663,7 @@ def active_endpoints(config: dict) -> list[tuple[int, dict]]:
 def default_config() -> dict:
     return {
         "auto_update_enabled": True,
+        "audio_sound": DEFAULT_AUDIO_NAME,
         "endpoint": "",
         "enabled": True,
         "endpoints": [blank_endpoint(index) for index in range(MAX_ENDPOINTS)],
@@ -1103,17 +1200,17 @@ def launch_update_installer(installer_path: Path) -> None:
     )
 
 
-def play_alert_sound() -> None:
+def play_alert_sound(audio_name: str = DEFAULT_AUDIO_NAME) -> None:
     if winsound is None:
         return
-    for name in ("eas_tone.wav", "eas_totne.wav"):
-        sound_path = resource_path(name)
-        if sound_path.exists():
-            try:
-                winsound.PlaySound(str(sound_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
-            except RuntimeError as exc:
-                log(f"sound failed: {exc}")
-            return
+    sound_path = find_audio_file(audio_name) or find_audio_file(DEFAULT_AUDIO_NAME)
+    if not sound_path:
+        log(f"sound file not found: {audio_name}")
+        return
+    try:
+        winsound.PlaySound(str(sound_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+    except RuntimeError as exc:
+        log(f"sound failed: {exc}")
 
 
 def wrap_for_canvas(text: str, width: int, max_lines: int) -> str:
@@ -1656,6 +1753,8 @@ class SettingsWindow:
         self.startup_var = BooleanVar(value=is_startup_enabled() or bool(cfg.get("startup_enabled", True)))
         self.auto_update_var = BooleanVar(value=bool(cfg.get("auto_update_enabled", True)))
         self.interval_var = IntVar(value=int(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS)))
+        self.audio_var = StringVar(value=safe_audio_name(safe_string(cfg.get("audio_sound")) or DEFAULT_AUDIO_NAME))
+        self.audio_combo: ttk.Combobox | None = None
         self.endpoint_forms: list[dict] = []
 
         self._build(cfg)
@@ -1681,16 +1780,18 @@ class SettingsWindow:
                     break
                 except Exception:
                     pass
-        self.window.configure(bg="#eef3f8")
-        style.configure(".", background="#eef3f8", foreground="#102033", font=("Segoe UI", 9))
-        style.configure("Surface.TFrame", background="#eef3f8")
+        self.window.configure(bg="#f4f7fb")
+        style.configure(".", background="#f4f7fb", foreground="#102033", font=("Segoe UI", 9))
+        style.configure("Surface.TFrame", background="#f4f7fb")
         style.configure("Card.TFrame", background="#ffffff", relief="flat")
-        style.configure("Header.TFrame", background="#0b5cad")
-        style.configure("Header.TLabel", background="#0b5cad", foreground="#ffffff", font=("Segoe UI", 17, "bold"))
-        style.configure("HeaderHint.TLabel", background="#0b5cad", foreground="#d9ebff", font=("Segoe UI", 9))
+        style.configure("Header.TFrame", background="#123a64")
+        style.configure("Header.TLabel", background="#123a64", foreground="#ffffff", font=("Segoe UI", 18, "bold"))
+        style.configure("HeaderHint.TLabel", background="#123a64", foreground="#dbeafe", font=("Segoe UI", 9))
         style.configure("Section.TLabel", background="#ffffff", foreground="#102033", font=("Segoe UI", 11, "bold"))
         style.configure("Hint.TLabel", background="#ffffff", foreground="#607084", font=("Segoe UI", 9))
-        style.configure("Status.TLabel", background="#eef3f8", foreground="#445166", font=("Segoe UI", 9))
+        style.configure("Status.TLabel", background="#f4f7fb", foreground="#445166", font=("Segoe UI", 9))
+        style.configure("RedWarning.TLabel", background="#ffffff", foreground="#b42318", font=("Segoe UI", 9, "bold"))
+        style.configure("YellowWarning.TLabel", background="#ffffff", foreground="#9a6700", font=("Segoe UI", 9, "bold"))
         style.configure("TCheckbutton", background="#ffffff", foreground="#102033")
         style.configure("TEntry", fieldbackground="#ffffff")
         style.configure("Accent.TButton", background="#0b72df", foreground="#ffffff", font=("Segoe UI", 9, "bold"), padding=(12, 6))
@@ -1755,7 +1856,7 @@ class SettingsWindow:
         ttk.Label(header, text="SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="Background alert monitoring, startup behavior, automatic updates, and up to three SIP notify endpoints.",
+            text="Background alerts, secure endpoint monitoring, customizable audio, and release-based updates.",
             style="HeaderHint.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -1775,12 +1876,12 @@ class SettingsWindow:
         )
         ttk.Checkbutton(
             general,
-            text="Automatically check GitHub for updates once daily",
+            text="Automatically install new GitHub Release updates",
             variable=self.auto_update_var,
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 8))
         ttk.Label(
             general,
-            text="Updates download the installer from the latest repository commit and may request Windows admin approval.",
+            text="Checks shortly after startup and about every 15 minutes while running. Updates download the published installer asset and may request Windows admin approval.",
             style="Hint.TLabel",
         ).grid(row=4, column=0, columnspan=5, sticky="w", pady=(0, 10))
         ttk.Label(general, text="Poll every", background="#ffffff").grid(row=5, column=0, sticky="w", padx=(0, 6))
@@ -1789,6 +1890,26 @@ class SettingsWindow:
         )
         ttk.Label(general, text="seconds", background="#ffffff").grid(row=5, column=2, sticky="w", padx=(6, 0))
         general.columnconfigure(5, weight=1)
+
+        audio = ttk.Frame(scrollable_frame, padding=16, style="Card.TFrame")
+        audio.pack(fill="x", pady=(0, 14))
+        ttk.Label(audio, text="Alert Audio", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(
+            audio,
+            text="Choose the WAV file to play once when a new alert or announcement appears.",
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 10))
+        self.audio_combo = ttk.Combobox(audio, textvariable=self.audio_var, values=list_audio_choices(), state="readonly", width=36)
+        self.audio_combo.grid(row=2, column=0, sticky="ew", padx=(0, 8))
+        ttk.Button(audio, text="Play", command=self.play_selected_audio).grid(row=2, column=1, sticky="w", padx=(0, 8))
+        ttk.Button(audio, text="Import WAV", command=self.import_audio).grid(row=2, column=2, sticky="w")
+        ttk.Label(
+            audio,
+            text="Bundled audio lives in the audio folder. Imported WAV files are copied to your app settings folder.",
+            style="Hint.TLabel",
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        audio.columnconfigure(0, weight=1)
+        self.refresh_audio_choices()
 
         endpoints_frame = ttk.Frame(scrollable_frame, padding=16, style="Card.TFrame")
         endpoints_frame.pack(fill="both", expand=True, pady=(0, 12))
@@ -1839,6 +1960,7 @@ class SettingsWindow:
             "no_token": BooleanVar(value=bool(endpoint.get("no_token", False))),
             "show_token": BooleanVar(value=False),
             "token_entry": None,
+            "warning_label": None,
         }
         self.endpoint_forms.append(form)
 
@@ -1880,9 +2002,14 @@ class SettingsWindow:
             text="No token calls this endpoint directly without an Authorization header.",
             style="Hint.TLabel",
         ).grid(row=row_offset + 5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        warning_label = ttk.Label(parent, text="", style="Hint.TLabel", wraplength=780)
+        warning_label.grid(row=row_offset + 6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        form["warning_label"] = warning_label
         parent.columnconfigure(0, weight=1)
         parent.columnconfigure(1, weight=2)
         parent.columnconfigure(2, weight=2)
+        form["endpoint"].trace_add("write", lambda *_args, idx=index: self.update_endpoint_warning(idx))
+        form["no_token"].trace_add("write", lambda *_args, idx=index: self.update_endpoint_warning(idx))
         self.toggle_no_token(index)
 
     def _center(self) -> None:
@@ -1893,6 +2020,50 @@ class SettingsWindow:
         x = max(0, int((screen_w - width) / 2))
         y = max(0, int((screen_h - height) / 3))
         self.window.geometry(f"+{x}+{y}")
+
+    def refresh_audio_choices(self) -> None:
+        choices = list_audio_choices()
+        selected = safe_audio_name(self.audio_var.get() or DEFAULT_AUDIO_NAME)
+        if selected not in choices and choices:
+            selected = choices[0]
+        if self.audio_combo is not None:
+            self.audio_combo.configure(values=choices)
+        self.audio_var.set(selected)
+
+    def play_selected_audio(self) -> None:
+        name = safe_audio_name(self.audio_var.get() or DEFAULT_AUDIO_NAME)
+        if not find_audio_file(name):
+            messagebox.showerror("Alert Audio", f"Audio file was not found:\n\n{name}")
+            return
+        play_alert_sound(name)
+
+    def import_audio(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Import alert audio",
+            filetypes=(("WAV audio", "*.wav"), ("All files", "*.*")),
+        )
+        if not selected:
+            return
+        try:
+            audio_name = import_custom_audio(Path(selected))
+            self.audio_var.set(audio_name)
+            self.refresh_audio_choices()
+            self.status_label.configure(text=f"Imported audio: {audio_name}")
+        except Exception as exc:
+            messagebox.showerror("Import Audio", f"Could not import audio:\n\n{exc}")
+
+    def update_endpoint_warning(self, index: int) -> None:
+        form = self.endpoint_forms[index]
+        label = form.get("warning_label")
+        if label is None:
+            return
+        warnings = endpoint_security_warnings(form["endpoint"].get().strip(), bool(form["no_token"].get()))
+        if not warnings:
+            label.configure(text="Security status: HTTPS endpoint with token authentication.", style="Hint.TLabel")
+            return
+        severity, _message = warnings[0]
+        text = "\n".join(message for _severity, message in warnings)
+        label.configure(text=text, style="RedWarning.TLabel" if severity == "red" else "YellowWarning.TLabel")
 
     def toggle_token(self, index: int) -> None:
         form = self.endpoint_forms[index]
@@ -1905,6 +2076,7 @@ class SettingsWindow:
         entry = form["token_entry"]
         if entry is not None:
             entry.configure(state="disabled" if form["no_token"].get() else "normal")
+        self.update_endpoint_warning(index)
 
     def collect_settings(self) -> tuple[list[dict], int] | None:
         try:
@@ -1914,6 +2086,7 @@ class SettingsWindow:
         interval = max(5, interval)
 
         endpoints: list[dict] = []
+        security_messages: list[str] = []
         active_count = 0
         for index, form in enumerate(self.endpoint_forms):
             name = form["name"].get().strip() or f"Endpoint {index + 1}"
@@ -1925,7 +2098,7 @@ class SettingsWindow:
             if url and not endpoint_url_allowed(url):
                 messagebox.showerror(
                     "Endpoint URL",
-                    f"Endpoint {index + 1} must use https://. http:// is only allowed for localhost testing.",
+                    f"Endpoint {index + 1} must be a valid http:// or https:// URL.",
                 )
                 return None
             if endpoint_enabled and url:
@@ -1935,6 +2108,8 @@ class SettingsWindow:
                         f"Endpoint {index + 1} needs a token, or check No token.",
                     )
                     return None
+                for _severity, warning in endpoint_security_warnings(url, no_token):
+                    security_messages.append(f"Endpoint {index + 1}: {warning}")
                 active_count += 1
 
             endpoints.append(
@@ -1952,6 +2127,13 @@ class SettingsWindow:
         if self.enabled_var.get() and active_count == 0:
             messagebox.showerror("No active endpoint", "Enable and configure at least one endpoint, or disable monitoring.")
             return None
+        if security_messages and not messagebox.askyesno(
+            "Endpoint Security Warnings",
+            "Review these endpoint security warnings before saving:\n\n"
+            + "\n\n".join(security_messages)
+            + "\n\nSave these settings anyway?",
+        ):
+            return None
         return endpoints, interval
 
     def save(self) -> bool:
@@ -1965,6 +2147,7 @@ class SettingsWindow:
             startup_enabled=self.startup_var.get(),
             auto_update_enabled=self.auto_update_var.get(),
             poll_seconds=interval,
+            audio_sound=safe_audio_name(self.audio_var.get() or DEFAULT_AUDIO_NAME),
         )
         self.status_label.configure(text="Saved. Monitoring will use the active endpoint tabs.")
         return True
@@ -2041,6 +2224,7 @@ class MassNotifyApp:
         startup_enabled: bool,
         auto_update_enabled: bool,
         poll_seconds: int,
+        audio_sound: str,
     ) -> None:
         with self.config_lock:
             normalized_endpoints = normalize_endpoints({"endpoints": endpoints})
@@ -2055,6 +2239,7 @@ class MassNotifyApp:
             self.config["startup_enabled"] = bool(startup_enabled)
             self.config["auto_update_enabled"] = bool(auto_update_enabled)
             self.config["poll_seconds"] = int(poll_seconds)
+            self.config["audio_sound"] = safe_audio_name(audio_sound or DEFAULT_AUDIO_NAME)
             self.config = normalize_config(self.config)
             save_config(self.config)
         set_startup_enabled(startup_enabled)
@@ -2174,7 +2359,7 @@ class MassNotifyApp:
             self.wakeup_event.clear()
 
     def update_loop(self) -> None:
-        if self.stop_event.wait(45):
+        if self.stop_event.wait(10):
             return
         while not self.stop_event.is_set():
             try:
@@ -2258,7 +2443,9 @@ class MassNotifyApp:
             self.root.after(200, self.process_ui_queue)
 
     def present_alert(self, alert: AlertData) -> None:
-        play_alert_sound()
+        with self.config_lock:
+            audio_name = safe_audio_name(safe_string(self.config.get("audio_sound")) or DEFAULT_AUDIO_NAME)
+        play_alert_sound(audio_name)
         AlertWindow(self, alert)
 
     def show_settings(self) -> None:

@@ -38,6 +38,7 @@ Write-Host "Building Program Files installer exe..." -ForegroundColor Green
     --icon "$ProjectRoot\favicon.ico" `
     --add-data "$AppExe;." `
     --add-data "$ProjectRoot\favicon.ico;." `
+    --add-data "$ProjectRoot\audio;audio" `
     "$ProjectRoot\sls_installer.py"
 
 if ($LASTEXITCODE -ne 0) {

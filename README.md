@@ -1,6 +1,6 @@
 # SouthlandServers Mass Notification App
 
-**Current version: V1.0.1**
+**Current version: V1.0.3**
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0A66C2)](#install)
 [![Python](https://img.shields.io/badge/built%20with-Python-3776AB)](#build-from-source)
@@ -9,7 +9,7 @@
 
 SouthlandServers Mass Notification App is an open-source Windows desktop companion for SIP NOTIFY, emergency alert, PBX announcement, and EAS-style visual notification workflows.
 
-It runs quietly in the background, starts with Windows if enabled, polls one or more HTTPS endpoints, plays the bundled EAS tone for new events, and displays clean desktop alert windows without requiring users to keep a browser open.
+It runs quietly in the background, starts with Windows if enabled, polls one or more endpoints, plays the selected WAV alert tone for new events, and displays clean desktop alert windows without requiring users to keep a browser open.
 
 [View Southland Servers Projects](https://southlandservers.xyz/projects)
 
@@ -21,10 +21,11 @@ It runs quietly in the background, starts with Windows if enabled, polls one or 
 | --- | --- |
 | Weather alerts | Shows NWS/SIP NOTIFY-style alert screens with title, priority, severity, area, effective time, and until/expires time. |
 | Announcements | Shows a simplified safe-format notice with a hazard icon, title, and body only. |
-| Endpoints | Supports up to three independent HTTPS endpoints. |
+| Endpoints | Supports up to three independent HTTP/HTTPS endpoints, with red warnings for non-local HTTP. |
 | Tokens | Supports bearer tokens per endpoint, plus a `No token` mode for trusted direct endpoints. |
 | Startup | Can register itself to run automatically when Windows starts. |
-| Updates | Optional automatic update checks from GitHub Releases once every 24 hours. |
+| Audio | Select bundled WAV tones from the `audio` folder, preview them, or import a custom WAV. |
+| Updates | Optional automatic update checks from GitHub Releases on startup and about every 15 minutes. |
 | Faults | Shows a desktop fault notification if an endpoint, token, or system issue remains unresolved for five minutes. |
 | Uninstall | Adds a normal Windows uninstall entry and Start Menu uninstall shortcut. |
 
@@ -64,7 +65,7 @@ The announcement window intentionally does not display endpoint internals, XML i
 
 ## Install
 
-Download the latest V1.0.1 installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
+Download the latest V1.0.3 installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
 
 ```text
 SLS_Mass_Notify_Installer.exe
@@ -85,9 +86,10 @@ Run the installer as Administrator. The installer will:
    ```
 
 3. Add a Windows Installed Apps uninstall entry.
-4. Ask whether the app should run at Windows startup.
-5. Ask whether automatic GitHub update checks should be enabled.
-6. Launch the Settings window after install.
+4. Require acceptance of the [Terms of Service](TERMS_OF_SERVICE.md).
+5. Ask whether the app should run at Windows startup.
+6. Ask whether automatic GitHub update checks should be enabled.
+7. Launch the Settings window after install.
 
 Windows SmartScreen may warn on unsigned builds. Code signing is recommended before broad public deployment.
 
@@ -96,11 +98,13 @@ Windows SmartScreen may warn on unsigned builds. Code signing is recommended bef
 When Settings opens, configure at least one endpoint.
 
 1. Enable the endpoint tab you want to use.
-2. Enter the HTTPS endpoint URL.
+2. Enter the endpoint URL. HTTPS is recommended.
 3. Enter the bearer token/key, or check `No token` if the endpoint is designed to be called directly.
-4. Choose the poll interval.
-5. Click `Test Active Endpoints`.
-6. Click `Save`.
+4. Review any red HTTP or yellow no-token security warnings.
+5. Choose the poll interval.
+6. Choose the alert audio tone or import your own `.wav`.
+7. Click `Test Active Endpoints`.
+8. Click `Save`.
 
 The app can monitor up to three endpoints at the same time. Each endpoint can have a different URL, token, enabled state, and no-token setting.
 
@@ -112,10 +116,10 @@ The background app polls each enabled endpoint on a timer.
 flowchart LR
     A[Windows Startup] --> B[SLS Mass Notify Background App]
     B --> C[Load Settings]
-    C --> D[Poll HTTPS Endpoints]
+    C --> D[Poll Configured Endpoints]
     D --> E{New latest.id?}
     E -- No --> D
-    E -- Yes --> F[Play eas_tone.wav once]
+    E -- Yes --> F[Play selected WAV once]
     F --> G{kind}
     G -- alert --> H[Show Weather Alert Screen]
     G -- announcement --> I[Show Safe Announcement Notice]
@@ -190,10 +194,33 @@ The app stores the last seen `latest.id` for each endpoint. A notification appea
 }
 ```
 
+## Custom Audio
+
+V1.0.3 moves alert sounds into the `audio` folder. The default tone is:
+
+```text
+audio\Announcement.wav
+```
+
+Bundled WAV files are packaged with the app and copied into Program Files during install. Settings includes:
+
+- a dropdown of available `.wav` files
+- a `Play` button to preview the selected tone
+- an `Import WAV` button for custom alert audio
+
+Imported audio is copied to:
+
+```text
+%APPDATA%\SouthlandServers\SLS_Mass_Notify\audio
+```
+
+Only `.wav` files under 25 MB are accepted for custom imports.
+
 ## Security Notes
 
 - Endpoint URLs should use `https://`.
-- `http://` is accepted only for localhost or loopback development testing.
+- Non-local `http://` endpoints are allowed but show a red warning because they may be vulnerable to man-in-the-middle attacks.
+- `No token` endpoints show a yellow caution because requests may not be fully authenticated.
 - Local tokens are encrypted with Windows DPAPI before being saved.
 - Settings are stored under:
 
@@ -208,7 +235,7 @@ The app stores the last seen `latest.id` for each endpoint. A notification appea
 
 Automatic updates are optional.
 
-When enabled, the app checks this GitHub repository once every 24 hours:
+When enabled, the app checks this GitHub repository shortly after startup and about every 15 minutes while running:
 
 ```text
 vipgabe09267/SouthlandServers_Mass_Notify_app
@@ -274,15 +301,15 @@ dist\SLS_Mass_Notify_Installer.exe
 
 Before publishing a release:
 
-1. Confirm `APP_VERSION` is still `1.0.1` for this V1.0.1 release.
+1. Confirm `APP_VERSION` is still `1.0.3` for this V1.0.3 release.
 2. Rebuild with `.\build-installer.ps1 -Clean`.
-3. Test install, settings save, endpoint test, background startup, alert display, announcement display, uninstall, and update preference.
+3. Test install, Terms acceptance, settings save, endpoint warnings, audio selection/play/import, endpoint test, background startup, alert display, announcement display, uninstall, and update preference.
 4. Attach `dist\SLS_Mass_Notify_Installer.exe` to the GitHub Release.
 5. Code sign the app and installer when a signing certificate is available.
 
 ## Project Status
 
-V1.0.1 is suitable for controlled testing, demos, pilots, and small trusted deployments.
+V1.0.3 is suitable for controlled testing, demos, pilots, and small trusted deployments.
 
 Recommended hardening before broad public production rollout:
 

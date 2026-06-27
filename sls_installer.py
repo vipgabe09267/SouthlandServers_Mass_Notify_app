@@ -24,9 +24,22 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 INSTALLER_EXE_NAME = "SLS_Mass_Notify_Uninstall.exe"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.3"
+AUDIO_DIR_NAME = "audio"
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 UNINSTALL_REG_PATH = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_SHORT_NAME}"
+
+TERMS_TEXT = """SouthlandServers Mass Notification App Terms of Service
+
+By installing or using this app, you acknowledge that it is a desktop notification client that polls user-configured endpoints and displays returned alert or announcement content.
+
+You are responsible for configuring endpoints, tokens, recipient systems, and server-side alert data accurately. The app does not create weather alerts, verify emergency content, or replace official emergency alerting systems.
+
+Use HTTPS endpoints whenever possible. HTTP endpoints may expose traffic to interception or modification. No-token endpoints may be appropriate only for trusted internal systems and are not recommended for public networks.
+
+The app stores local settings under the current Windows user profile and protects saved tokens with Windows DPAPI when available. The app may check GitHub Releases for updates if automatic updates are enabled during install or in Settings.
+
+This software is provided under the GNU General Public License v3.0 without warranty. You agree to test deployments before operational use and to comply with all applicable laws, policies, and emergency communication requirements."""
 
 PROGRAM_FILES = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
 DEFAULT_INSTALL_DIR = PROGRAM_FILES / COMPANY_DISPLAY_NAME / "SLS Mass Notify"
@@ -249,6 +262,19 @@ def write_auto_update_preference(enabled: bool | None, progress: ProgressCallbac
     temp_path.replace(CONFIG_PATH)
 
 
+def copy_audio_assets(install_dir: Path, progress: ProgressCallback | None = None) -> None:
+    audio_source = resource_path(AUDIO_DIR_NAME)
+    if not audio_source.exists() or not audio_source.is_dir():
+        emit(progress, "Bundled audio folder was not found; skipping audio asset copy.")
+        return
+    audio_destination = install_dir / AUDIO_DIR_NAME
+    emit(progress, f"Installing alert audio to {audio_destination}")
+    audio_destination.mkdir(parents=True, exist_ok=True)
+    for source in audio_source.glob("*.wav"):
+        if source.is_file():
+            shutil.copy2(source, audio_destination / source.name)
+
+
 def install_app(
     install_dir: Path,
     *,
@@ -276,6 +302,7 @@ def install_app(
 
     emit(progress, f"Installing {EXE_NAME} to {app_path}")
     shutil.copy2(app_payload, app_path)
+    copy_audio_assets(install_dir, progress)
     if getattr(sys, "frozen", False):
         emit(progress, f"Installing {INSTALLER_EXE_NAME} to {uninstaller_path}")
         shutil.copy2(Path(sys.executable), uninstaller_path)
@@ -404,6 +431,7 @@ class InstallerWindow:
         self.startup = BooleanVar(value=True)
         self.launch = BooleanVar(value=True)
         self.auto_update = BooleanVar(value=True)
+        self.accept_terms = BooleanVar(value=False)
         self.status = StringVar(value="Ready to install.")
         self.install_button: ttk.Button | None = None
         self.cancel_button: ttk.Button | None = None
@@ -438,23 +466,42 @@ class InstallerWindow:
         )
         ttk.Checkbutton(
             frame,
-            text="Automatically check GitHub for updates once every 24 hours",
+            text="Automatically install new GitHub Release updates",
             variable=self.auto_update,
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
-        self.progressbar = ttk.Progressbar(frame, mode="indeterminate")
-        self.progressbar.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 8))
-        self.log_box = Text(frame, width=86, height=8, wrap="word", state="disabled")
-        self.log_box.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+        ttk.Label(frame, text="Terms of Service", font=("Segoe UI", 9, "bold")).grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(8, 3)
+        )
+        terms_box = Text(frame, width=86, height=8, wrap="word", state="normal")
+        terms_box.insert("1.0", TERMS_TEXT)
+        terms_box.configure(state="disabled")
+        terms_box.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        ttk.Checkbutton(
+            frame,
+            text="I accept the Terms of Service",
+            variable=self.accept_terms,
+            command=self.update_install_button_state,
+        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-        ttk.Separator(frame).grid(row=9, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        self.progressbar = ttk.Progressbar(frame, mode="indeterminate")
+        self.progressbar.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(8, 8))
+        self.log_box = Text(frame, width=86, height=8, wrap="word", state="disabled")
+        self.log_box.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+
+        ttk.Separator(frame).grid(row=12, column=0, columnspan=3, sticky="ew", pady=(0, 12))
         ttk.Label(frame, textvariable=self.status, foreground="#444444").grid(
-            row=10, column=0, sticky="w"
+            row=13, column=0, sticky="w"
         )
         self.cancel_button = ttk.Button(frame, text="Cancel", command=self.root.destroy)
-        self.cancel_button.grid(row=10, column=1, sticky="e", padx=(0, 8))
+        self.cancel_button.grid(row=13, column=1, sticky="e", padx=(0, 8))
         self.install_button = ttk.Button(frame, text="Install", command=self.install)
-        self.install_button.grid(row=10, column=2, sticky="e")
+        self.install_button.grid(row=13, column=2, sticky="e")
+        self.update_install_button_state()
+
+    def update_install_button_state(self) -> None:
+        if self.install_button is not None:
+            self.install_button.configure(state="normal" if self.accept_terms.get() else "disabled")
 
     def log(self, message: str) -> None:
         self.status.set(message)
@@ -480,6 +527,9 @@ class InstallerWindow:
 
     def install(self) -> None:
         try:
+            if not self.accept_terms.get():
+                messagebox.showwarning(APP_DISPLAY_NAME, "You must accept the Terms of Service before installing.")
+                return
             install_dir = Path(self.install_dir.get()).resolve()
             if self.install_button is not None:
                 self.install_button.configure(state="disabled")
