@@ -1,10 +1,10 @@
 # SouthlandServers Mass Notification App
 
-**Current version: V1.0.3**
+**Current version: V1.0.4**
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0A66C2)](#install)
 [![Python](https://img.shields.io/badge/built%20with-Python-3776AB)](#build-from-source)
-[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPLv3-blue)](LICENSE)
 [![Southland Servers](https://img.shields.io/badge/Southland%20Servers-Projects-111827)](https://southlandservers.xyz/projects)
 
 SouthlandServers Mass Notification App is an open-source Windows desktop companion for SIP NOTIFY, emergency alert, PBX announcement, and EAS-style visual notification workflows.
@@ -65,7 +65,7 @@ The announcement window intentionally does not display endpoint internals, XML i
 
 ## Install
 
-Download the latest V1.0.3 installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
+Download the latest V1.0.4 installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
 
 ```text
 SLS_Mass_Notify_Installer.exe
@@ -196,7 +196,7 @@ The app stores the last seen `latest.id` for each endpoint. A notification appea
 
 ## Custom Audio
 
-V1.0.3 moves alert sounds into the `audio` folder. The default tone is:
+V1.0.4 keeps alert sounds in the `audio` folder. The default tone is:
 
 ```text
 audio\Announcement.wav
@@ -301,7 +301,7 @@ dist\SLS_Mass_Notify_Installer.exe
 
 Before publishing a release:
 
-1. Confirm `APP_VERSION` is still `1.0.3` for this V1.0.3 release.
+1. Confirm `APP_VERSION` is still `1.0.4` for this V1.0.4 release.
 2. Rebuild with `.\build-installer.ps1 -Clean`.
 3. Test install, Terms acceptance, settings save, endpoint warnings, audio selection/play/import, endpoint test, background startup, alert display, announcement display, uninstall, and update preference.
 4. Attach `dist\SLS_Mass_Notify_Installer.exe` to the GitHub Release.
@@ -309,7 +309,7 @@ Before publishing a release:
 
 ## Project Status
 
-V1.0.3 is suitable for controlled testing, demos, pilots, and small trusted deployments.
+V1.0.4 is suitable for controlled testing, demos, pilots, and small trusted deployments.
 
 Recommended hardening before broad public production rollout:
 
@@ -321,6 +321,6 @@ Recommended hardening before broad public production rollout:
 
 ## License
 
-This project is open source under the [GNU General Public License v3.0](LICENSE).
+This project is open source under the [GNU Affero General Public License v3.0](LICENSE).
 
 Contributions, forks, audits, and integrations are welcome under the same copyleft license terms.

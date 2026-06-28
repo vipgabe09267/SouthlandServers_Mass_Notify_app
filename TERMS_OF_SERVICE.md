@@ -8,4 +8,4 @@ Use HTTPS endpoints whenever possible. HTTP endpoints may expose traffic to inte
 
 The app stores local settings under the current Windows user profile and protects saved tokens with Windows DPAPI when available. The app may check GitHub Releases for updates if automatic updates are enabled during install or in Settings.
 
-This software is provided under the GNU General Public License v3.0 without warranty. Test deployments before operational use and comply with all applicable laws, policies, and emergency communication requirements.
+This software is provided under the GNU Affero General Public License v3.0 without warranty. Test deployments before operational use and comply with all applicable laws, policies, and emergency communication requirements.
