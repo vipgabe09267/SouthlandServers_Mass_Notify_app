@@ -49,7 +49,7 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 COMPANY_NAME = "SouthlandServers"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5-Beta"
 IPC_HOST = "127.0.0.1"
 IPC_PORT = 48572
 DEFAULT_POLL_SECONDS = 10
@@ -65,6 +65,14 @@ UPDATE_DOWNLOAD_LIMIT_BYTES = 150 * 1024 * 1024
 AUDIO_DIR_NAME = "audio"
 DEFAULT_AUDIO_NAME = "Announcement.wav"
 MAX_CUSTOM_AUDIO_BYTES = 25 * 1024 * 1024
+AUTH_TOKEN = "token"
+AUTH_NONE = "none"
+AUTH_BASIC = "basic"
+AUTH_LABELS = {
+    AUTH_TOKEN: "Bearer token",
+    AUTH_NONE: "No authentication",
+    AUTH_BASIC: "Username/password",
+}
 GITHUB_OWNER = "vipgabe09267"
 GITHUB_REPO = "SouthlandServers_Mass_Notify_app"
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases?per_page=10"
@@ -471,23 +479,42 @@ def blank_endpoint(index: int) -> dict:
         "name": f"Endpoint {index + 1}",
         "endpoint": "",
         "enabled": index == 0,
+        "auth_mode": AUTH_TOKEN,
         "no_token": False,
         "token": "",
+        "username": "",
+        "password": "",
         "last_event_id": "",
         "last_fingerprint": "",
     }
 
 
+def normalize_auth_mode(value: object, no_token: bool = False) -> str:
+    mode = normalize_key(value or "")
+    if no_token:
+        return AUTH_NONE
+    if mode in {"none", "noauth", "noauthentication", "notoken"}:
+        return AUTH_NONE
+    if mode in {"basic", "usernamepassword", "userpass", "password"}:
+        return AUTH_BASIC
+    return AUTH_TOKEN
+
+
 def normalize_endpoint(value: object, index: int) -> dict:
     endpoint = blank_endpoint(index)
     if isinstance(value, dict):
+        no_token = bool(value.get("no_token", value.get("noToken", False)))
+        auth_mode = normalize_auth_mode(value.get("auth_mode", value.get("authMode", "")), no_token)
         endpoint.update(
             {
                 "name": safe_string(value.get("name")) or endpoint["name"],
                 "endpoint": safe_string(value.get("endpoint") or value.get("url")),
                 "enabled": bool(value.get("enabled", endpoint["enabled"])),
-                "no_token": bool(value.get("no_token", value.get("noToken", False))),
+                "auth_mode": auth_mode,
+                "no_token": auth_mode == AUTH_NONE,
                 "token": safe_string(value.get("token")),
+                "username": safe_string(value.get("username", value.get("user", ""))),
+                "password": safe_string(value.get("password")),
                 "last_event_id": safe_string(value.get("last_event_id", value.get("lastEventId", ""))),
                 "last_fingerprint": safe_string(
                     value.get("last_fingerprint", value.get("lastFingerprint", ""))
@@ -511,8 +538,11 @@ def normalize_endpoints(config: dict) -> list[dict]:
                     "name": "Endpoint 1",
                     "endpoint": config.get("endpoint", ""),
                     "enabled": True,
+                    "auth_mode": AUTH_NONE if bool(config.get("no_token", False)) else AUTH_TOKEN,
                     "no_token": bool(config.get("no_token", False)),
                     "token": config.get("token", ""),
+                    "username": config.get("username", ""),
+                    "password": config.get("password", ""),
                     "last_event_id": config.get("last_event_id", ""),
                     "last_fingerprint": config.get("last_fingerprint", ""),
                 },
@@ -535,6 +565,9 @@ def normalize_config(config: dict) -> dict:
     first = normalized["endpoints"][0]
     normalized["endpoint"] = first.get("endpoint", "")
     normalized["token"] = first.get("token", "")
+    normalized["username"] = first.get("username", "")
+    normalized["password"] = first.get("password", "")
+    normalized["auth_mode"] = normalize_auth_mode(first.get("auth_mode"), bool(first.get("no_token", False)))
     normalized["no_token"] = bool(first.get("no_token", False))
     normalized["last_event_id"] = first.get("last_event_id", "")
     normalized["last_fingerprint"] = first.get("last_fingerprint", "")
@@ -543,8 +576,11 @@ def normalize_config(config: dict) -> dict:
 
 
 def endpoint_has_credentials(endpoint: dict) -> bool:
-    if endpoint.get("no_token"):
+    auth_mode = normalize_auth_mode(endpoint.get("auth_mode"), bool(endpoint.get("no_token")))
+    if auth_mode == AUTH_NONE:
         return True
+    if auth_mode == AUTH_BASIC:
+        return bool(safe_string(endpoint.get("username")) and unprotect_secret(endpoint.get("password", "")))
     return bool(unprotect_secret(endpoint.get("token", "")))
 
 
@@ -565,7 +601,7 @@ def endpoint_url_allowed(url: str) -> bool:
     return False
 
 
-def endpoint_security_warnings(url: str, no_token: bool) -> list[tuple[str, str]]:
+def endpoint_security_warnings(url: str, auth_mode: str) -> list[tuple[str, str]]:
     warnings: list[tuple[str, str]] = []
     parsed = urlparse(safe_string(url))
     if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
@@ -575,7 +611,7 @@ def endpoint_security_warnings(url: str, no_token: bool) -> list[tuple[str, str]
                 "Warning: this HTTP endpoint may be vulnerable to man-in-the-middle attacks. Use HTTPS when possible.",
             )
         )
-    if no_token:
+    if normalize_auth_mode(auth_mode) == AUTH_NONE:
         warnings.append(
             (
                 "yellow",
@@ -677,6 +713,8 @@ def default_config() -> dict:
         "poll_seconds": DEFAULT_POLL_SECONDS,
         "startup_enabled": True,
         "token": "",
+        "username": "",
+        "password": "",
         "last_event_id": "",
         "last_fingerprint": "",
     }
@@ -1002,13 +1040,29 @@ class UnauthorizedError(ApiError):
     pass
 
 
-def fetch_endpoint(endpoint: str, token: str) -> tuple[object, str]:
+def endpoint_auth_headers(endpoint_cfg: dict) -> dict[str, str]:
+    auth_mode = normalize_auth_mode(endpoint_cfg.get("auth_mode"), bool(endpoint_cfg.get("no_token")))
+    if auth_mode == AUTH_NONE:
+        return {}
+    if auth_mode == AUTH_BASIC:
+        username = safe_string(endpoint_cfg.get("username"))
+        password = unprotect_secret(endpoint_cfg.get("password", ""))
+        if not username or not password:
+            return {}
+        raw = f"{username}:{password}".encode("utf-8")
+        return {"Authorization": "Basic " + base64.b64encode(raw).decode("ascii")}
+    token = unprotect_secret(endpoint_cfg.get("token", ""))
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+def fetch_endpoint(endpoint: str, auth_headers: dict[str, str] | None = None) -> tuple[object, str]:
     headers = {
         "Accept": "application/json, application/xml, text/xml, text/plain, */*",
         "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers.update(auth_headers or {})
     request = urllib.request.Request(endpoint, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -1016,7 +1070,7 @@ def fetch_endpoint(endpoint: str, token: str) -> tuple[object, str]:
             raw_bytes = response.read(1024 * 1024)
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
-            raise UnauthorizedError("Unauthorized request. Check endpoint and token.") from exc
+            raise UnauthorizedError("Unauthorized request. Check endpoint credentials.") from exc
         raise ApiError(f"HTTP {exc.code}: {exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise ApiError(str(exc.reason)) from exc
@@ -1737,7 +1791,7 @@ class SettingsWindow:
     def __init__(self, app: "MassNotifyApp") -> None:
         self.app = app
         self.window = Toplevel(app.root)
-        self.window.title("SLS Mass Notify Settings")
+        self.window.title("SLS Mass Notify App")
         self._set_initial_geometry()
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         icon = resource_path("favicon.ico")
@@ -1766,10 +1820,10 @@ class SettingsWindow:
     def _set_initial_geometry(self) -> None:
         screen_w = self.window.winfo_screenwidth()
         screen_h = self.window.winfo_screenheight()
-        width = max(780, min(960, screen_w - 80))
-        height = max(560, min(680, screen_h - 140))
+        width = max(940, min(1120, screen_w - 80))
+        height = max(680, min(820, screen_h - 120))
         self.window.geometry(f"{width}x{height}")
-        self.window.minsize(760, 560)
+        self.window.minsize(900, 640)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self.window)
@@ -1780,87 +1834,87 @@ class SettingsWindow:
                     break
                 except Exception:
                     pass
-        self.window.configure(bg="#f4f7fb")
-        style.configure(".", background="#f4f7fb", foreground="#102033", font=("Segoe UI", 9))
-        style.configure("Surface.TFrame", background="#f4f7fb")
+        self.window.configure(bg="#f7f9fc")
+        style.configure(".", background="#f7f9fc", foreground="#101828", font=("Segoe UI", 9))
+        style.configure("Surface.TFrame", background="#f7f9fc")
         style.configure("Card.TFrame", background="#ffffff", relief="flat")
-        style.configure("Header.TFrame", background="#123a64")
-        style.configure("Header.TLabel", background="#123a64", foreground="#ffffff", font=("Segoe UI", 18, "bold"))
-        style.configure("HeaderHint.TLabel", background="#123a64", foreground="#dbeafe", font=("Segoe UI", 9))
-        style.configure("Section.TLabel", background="#ffffff", foreground="#102033", font=("Segoe UI", 11, "bold"))
-        style.configure("Hint.TLabel", background="#ffffff", foreground="#607084", font=("Segoe UI", 9))
-        style.configure("Status.TLabel", background="#f4f7fb", foreground="#445166", font=("Segoe UI", 9))
+        style.configure("Header.TFrame", background="#0f172a")
+        style.configure("Header.TLabel", background="#0f172a", foreground="#ffffff", font=("Segoe UI", 20, "bold"))
+        style.configure("HeaderHint.TLabel", background="#0f172a", foreground="#cbd5e1", font=("Segoe UI", 9))
+        style.configure("Section.TLabel", background="#ffffff", foreground="#101828", font=("Segoe UI", 12, "bold"))
+        style.configure("Hint.TLabel", background="#ffffff", foreground="#667085", font=("Segoe UI", 9))
+        style.configure("Status.TLabel", background="#f7f9fc", foreground="#475467", font=("Segoe UI", 9))
         style.configure("RedWarning.TLabel", background="#ffffff", foreground="#b42318", font=("Segoe UI", 9, "bold"))
         style.configure("YellowWarning.TLabel", background="#ffffff", foreground="#9a6700", font=("Segoe UI", 9, "bold"))
         style.configure("TCheckbutton", background="#ffffff", foreground="#102033")
         style.configure("TEntry", fieldbackground="#ffffff")
-        style.configure("Accent.TButton", background="#0b72df", foreground="#ffffff", font=("Segoe UI", 9, "bold"), padding=(12, 6))
-        style.map("Accent.TButton", background=[("active", "#075eb8"), ("pressed", "#054f9f")])
+        style.configure("Accent.TButton", background="#2563eb", foreground="#ffffff", font=("Segoe UI", 9, "bold"), padding=(14, 7))
+        style.map("Accent.TButton", background=[("active", "#1d4ed8"), ("pressed", "#1e40af")])
 
     def _build(self, cfg: dict) -> None:
-        # Configure main window grid layout
-        self.window.rowconfigure(0, weight=1)  # Scrollable content expands
+        self.window.rowconfigure(1, weight=1)
         self.window.columnconfigure(0, weight=1)
-        
-        # Create outer container for canvas and scrollbar
-        scroll_frame = ttk.Frame(self.window, style="Surface.TFrame")
-        scroll_frame.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
 
-        # Create canvas and scrollbar
-        canvas = Canvas(scroll_frame, bg="#eef3f8", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(scroll_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas, padding=18, style="Surface.TFrame")
-        
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-
-        # Pack canvas and scrollbar
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        def _on_mousewheel(event):
-            units = int(-1 * (event.delta / 120)) if event.delta else 0
-            if units == 0:
-                units = -1 if event.delta > 0 else 1
-            canvas.yview_scroll(units, "units")
-            return "break"
-
-        def _on_scroll_up(_event):
-            canvas.yview_scroll(-1, "units")
-            return "break"
-
-        def _on_scroll_down(_event):
-            canvas.yview_scroll(1, "units")
-            return "break"
-
-        def _bind_mousewheel(widget):
-            widget.bind("<MouseWheel>", _on_mousewheel, add="+")
-            widget.bind("<Button-4>", _on_scroll_up, add="+")
-            widget.bind("<Button-5>", _on_scroll_down, add="+")
-            for child in widget.winfo_children():
-                _bind_mousewheel(child)
-
-        # Update canvas scrollregion after widgets are created
-        def _update_scroll_region(event=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            # Make inner frame width match canvas width
-            if canvas.winfo_width() > 1:
-                canvas.itemconfig(canvas_window, width=canvas.winfo_width())
-
-        scrollable_frame.bind("<Configure>", _update_scroll_region)
-        canvas.bind("<Configure>", lambda e: _update_scroll_region() if e.width > 1 else None)
-
-        # Build header
-        header = ttk.Frame(scrollable_frame, padding=18, style="Header.TFrame")
-        header.pack(fill="x", pady=(0, 14))
-        ttk.Label(header, text="SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
+        header = ttk.Frame(self.window, padding=(22, 18), style="Header.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text="SLS Mass Notify App", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="Background alerts, secure endpoint monitoring, customizable audio, and release-based updates.",
+            text="Mass notification monitoring, endpoint authentication, audio, and startup behavior.",
             style="HeaderHint.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
-        general = ttk.Frame(scrollable_frame, padding=16, style="Card.TFrame")
+        content = ttk.Frame(self.window, style="Surface.TFrame")
+        content.grid(row=1, column=0, sticky="nsew", padx=18, pady=(16, 10))
+
+        def make_scroll_area(parent: ttk.Frame) -> ttk.Frame:
+            parent.rowconfigure(0, weight=1)
+            parent.columnconfigure(0, weight=1)
+            scroll_frame = ttk.Frame(parent, style="Surface.TFrame")
+            scroll_frame.grid(row=0, column=0, sticky="nsew")
+            canvas = Canvas(scroll_frame, bg="#f7f9fc", highlightthickness=0, bd=0)
+            scrollbar = ttk.Scrollbar(scroll_frame, orient="vertical", command=canvas.yview)
+            inner = ttk.Frame(canvas, padding=(4, 4, 14, 14), style="Surface.TFrame")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+
+            def on_mousewheel(event):
+                units = int(-1 * (event.delta / 120)) if event.delta else 0
+                if units == 0:
+                    units = -1 if event.delta > 0 else 1
+                canvas.yview_scroll(units, "units")
+                return "break"
+
+            def on_scroll_up(_event):
+                canvas.yview_scroll(-1, "units")
+                return "break"
+
+            def on_scroll_down(_event):
+                canvas.yview_scroll(1, "units")
+                return "break"
+
+            def bind_mousewheel(widget):
+                widget.bind("<MouseWheel>", on_mousewheel, add="+")
+                widget.bind("<Button-4>", on_scroll_up, add="+")
+                widget.bind("<Button-5>", on_scroll_down, add="+")
+                for child in widget.winfo_children():
+                    bind_mousewheel(child)
+
+            def update_scroll_region(_event=None):
+                canvas.configure(scrollregion=canvas.bbox("all"))
+                if canvas.winfo_width() > 1:
+                    canvas.itemconfig(canvas_window, width=canvas.winfo_width())
+                bind_mousewheel(inner)
+
+            inner.bind("<Configure>", update_scroll_region)
+            canvas.bind("<Configure>", update_scroll_region)
+            return inner
+
+        mass_frame = make_scroll_area(content)
+
+        general = ttk.Frame(mass_frame, padding=18, style="Card.TFrame")
         general.pack(fill="x", pady=(0, 14))
         ttk.Label(general, text="General", style="Section.TLabel").grid(row=0, column=0, columnspan=5, sticky="w")
         ttk.Label(
@@ -1891,7 +1945,7 @@ class SettingsWindow:
         ttk.Label(general, text="seconds", background="#ffffff").grid(row=5, column=2, sticky="w", padx=(6, 0))
         general.columnconfigure(5, weight=1)
 
-        audio = ttk.Frame(scrollable_frame, padding=16, style="Card.TFrame")
+        audio = ttk.Frame(mass_frame, padding=18, style="Card.TFrame")
         audio.pack(fill="x", pady=(0, 14))
         ttk.Label(audio, text="Alert Audio", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(
@@ -1911,12 +1965,12 @@ class SettingsWindow:
         audio.columnconfigure(0, weight=1)
         self.refresh_audio_choices()
 
-        endpoints_frame = ttk.Frame(scrollable_frame, padding=16, style="Card.TFrame")
+        endpoints_frame = ttk.Frame(mass_frame, padding=18, style="Card.TFrame")
         endpoints_frame.pack(fill="both", expand=True, pady=(0, 12))
         ttk.Label(endpoints_frame, text="Alert Endpoints", style="Section.TLabel").pack(anchor="w")
         ttk.Label(
             endpoints_frame,
-            text="Each active endpoint may use its own bearer token, or No token mode for trusted direct endpoints.",
+            text="Each active endpoint can use bearer token, username/password, or no authentication for trusted direct endpoints.",
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(2, 12))
         for index, endpoint in enumerate(normalize_endpoints(cfg)):
@@ -1927,10 +1981,9 @@ class SettingsWindow:
             )
             self._build_endpoint_tab(group, index, endpoint)
 
-        # Footer stays at bottom with separator
-        ttk.Separator(self.window).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        ttk.Separator(self.window).grid(row=2, column=0, sticky="ew", pady=(2, 0))
         footer = ttk.Frame(self.window, padding=(2, 0), style="Surface.TFrame")
-        footer.grid(row=2, column=0, sticky="ew", padx=12, pady=8)
+        footer.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 12))
         footer.columnconfigure(0, weight=1)  # Status expands
         
         # Status label on left side
@@ -1949,35 +2002,45 @@ class SettingsWindow:
         ttk.Button(actions, text="Close", command=self.close).pack(side="left", padx=(0, 6))
         ttk.Button(actions, text="Quit App", command=self.quit_app).pack(side="left")
 
-        _bind_mousewheel(self.window)
 
     def _build_endpoint_tab(self, parent: ttk.Frame, index: int, endpoint: dict) -> None:
+        auth_mode = normalize_auth_mode(endpoint.get("auth_mode"), bool(endpoint.get("no_token")))
         form = {
             "name": StringVar(value=safe_string(endpoint.get("name")) or f"Endpoint {index + 1}"),
             "endpoint": StringVar(value=safe_string(endpoint.get("endpoint"))),
             "token": StringVar(value=unprotect_secret(safe_string(endpoint.get("token")))),
+            "username": StringVar(value=safe_string(endpoint.get("username"))),
+            "password": StringVar(value=unprotect_secret(safe_string(endpoint.get("password")))),
+            "auth_mode": StringVar(value=AUTH_LABELS.get(auth_mode, AUTH_LABELS[AUTH_TOKEN])),
             "enabled": BooleanVar(value=bool(endpoint.get("enabled", index == 0))),
-            "no_token": BooleanVar(value=bool(endpoint.get("no_token", False))),
             "show_token": BooleanVar(value=False),
             "token_entry": None,
+            "username_entry": None,
+            "password_entry": None,
+            "token_widgets": [],
+            "basic_widgets": [],
             "warning_label": None,
         }
         self.endpoint_forms.append(form)
 
         row_offset = 1
         ttk.Checkbutton(parent, text="Enabled", variable=form["enabled"]).grid(row=row_offset, column=0, sticky="w")
+        ttk.Label(parent, text="Authentication", background="#ffffff").grid(row=row_offset, column=1, sticky="e", padx=(18, 8))
+        auth_combo = ttk.Combobox(
+            parent,
+            textvariable=form["auth_mode"],
+            values=list(AUTH_LABELS.values()),
+            state="readonly",
+            width=22,
+        )
+        auth_combo.grid(row=row_offset, column=2, sticky="w")
+        auth_combo.bind("<<ComboboxSelected>>", lambda _event, idx=index: self.update_auth_mode(idx))
         ttk.Checkbutton(
             parent,
-            text="No token",
-            variable=form["no_token"],
-            command=lambda idx=index: self.toggle_no_token(idx),
-        ).grid(row=row_offset, column=1, sticky="w", padx=(18, 0))
-        ttk.Checkbutton(
-            parent,
-            text="Show token",
+            text="Show secrets",
             variable=form["show_token"],
             command=lambda idx=index: self.toggle_token(idx),
-        ).grid(row=row_offset, column=2, sticky="w", padx=(18, 0))
+        ).grid(row=row_offset, column=3, sticky="w", padx=(18, 0))
 
         ttk.Label(parent, text="Name", background="#ffffff").grid(row=row_offset + 1, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(parent, textvariable=form["name"], width=24).grid(
@@ -1985,32 +2048,47 @@ class SettingsWindow:
         )
 
         ttk.Label(parent, text="Endpoint URL", background="#ffffff").grid(
-            row=row_offset + 1, column=1, columnspan=2, sticky="w", pady=(10, 0)
+            row=row_offset + 1, column=1, columnspan=3, sticky="w", pady=(10, 0)
         )
         ttk.Entry(parent, textvariable=form["endpoint"], width=64).grid(
-            row=row_offset + 2, column=1, columnspan=2, sticky="ew", pady=(3, 0), padx=(0, 10)
+            row=row_offset + 2, column=1, columnspan=3, sticky="ew", pady=(3, 0), padx=(0, 10)
         )
 
-        ttk.Label(parent, text="Authorization token / key", background="#ffffff").grid(
-            row=row_offset + 3, column=0, sticky="w", pady=(10, 0)
+        token_label = ttk.Label(parent, text="Authorization token / key", background="#ffffff")
+        token_label.grid(
+            row=row_offset + 3, column=0, columnspan=4, sticky="w", pady=(10, 0)
         )
         token_entry = ttk.Entry(parent, textvariable=form["token"], width=80, show="*")
-        token_entry.grid(row=row_offset + 4, column=0, columnspan=3, sticky="ew", pady=(3, 0), padx=(0, 10))
+        token_entry.grid(row=row_offset + 4, column=0, columnspan=4, sticky="ew", pady=(3, 0), padx=(0, 10))
         form["token_entry"] = token_entry
+        form["token_widgets"] = [token_label, token_entry]
+
+        username_label = ttk.Label(parent, text="Username", background="#ffffff")
+        username_label.grid(row=row_offset + 3, column=0, sticky="w", pady=(10, 0))
+        username_entry = ttk.Entry(parent, textvariable=form["username"], width=28)
+        username_entry.grid(row=row_offset + 4, column=0, sticky="ew", pady=(3, 0), padx=(0, 10))
+        form["username_entry"] = username_entry
+        password_label = ttk.Label(parent, text="Password", background="#ffffff")
+        password_label.grid(row=row_offset + 3, column=1, sticky="w", pady=(10, 0))
+        password_entry = ttk.Entry(parent, textvariable=form["password"], width=36, show="*")
+        password_entry.grid(row=row_offset + 4, column=1, columnspan=3, sticky="ew", pady=(3, 0), padx=(0, 10))
+        form["password_entry"] = password_entry
+        form["basic_widgets"] = [username_label, username_entry, password_label, password_entry]
         ttk.Label(
             parent,
-            text="No token calls this endpoint directly without an Authorization header.",
+            text="Bearer token uses Authorization: Bearer. Username/password uses HTTP Basic auth. No authentication sends no Authorization header.",
             style="Hint.TLabel",
-        ).grid(row=row_offset + 5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=row_offset + 5, column=0, columnspan=4, sticky="w", pady=(8, 0))
         warning_label = ttk.Label(parent, text="", style="Hint.TLabel", wraplength=780)
-        warning_label.grid(row=row_offset + 6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        warning_label.grid(row=row_offset + 6, column=0, columnspan=4, sticky="w", pady=(6, 0))
         form["warning_label"] = warning_label
         parent.columnconfigure(0, weight=1)
-        parent.columnconfigure(1, weight=2)
-        parent.columnconfigure(2, weight=2)
+        parent.columnconfigure(1, weight=1)
+        parent.columnconfigure(2, weight=1)
+        parent.columnconfigure(3, weight=1)
         form["endpoint"].trace_add("write", lambda *_args, idx=index: self.update_endpoint_warning(idx))
-        form["no_token"].trace_add("write", lambda *_args, idx=index: self.update_endpoint_warning(idx))
-        self.toggle_no_token(index)
+        form["auth_mode"].trace_add("write", lambda *_args, idx=index: self.update_auth_mode(idx))
+        self.update_auth_mode(index)
 
     def _center(self) -> None:
         width = self.window.winfo_width()
@@ -2057,25 +2135,47 @@ class SettingsWindow:
         label = form.get("warning_label")
         if label is None:
             return
-        warnings = endpoint_security_warnings(form["endpoint"].get().strip(), bool(form["no_token"].get()))
+        auth_mode = self.form_auth_mode(form)
+        warnings = endpoint_security_warnings(form["endpoint"].get().strip(), auth_mode)
         if not warnings:
-            label.configure(text="Security status: HTTPS endpoint with token authentication.", style="Hint.TLabel")
+            label.configure(text="Security status: endpoint/auth settings look normal.", style="Hint.TLabel")
             return
         severity, _message = warnings[0]
         text = "\n".join(message for _severity, message in warnings)
         label.configure(text=text, style="RedWarning.TLabel" if severity == "red" else "YellowWarning.TLabel")
 
+    def form_auth_mode(self, form: dict) -> str:
+        selected = form["auth_mode"].get()
+        for mode, label in AUTH_LABELS.items():
+            if selected == label:
+                return mode
+        return AUTH_TOKEN
+
     def toggle_token(self, index: int) -> None:
         form = self.endpoint_forms[index]
-        entry = form["token_entry"]
-        if entry is not None:
-            entry.configure(show="" if form["show_token"].get() else "*")
+        show = "" if form["show_token"].get() else "*"
+        for key in ("token_entry", "password_entry"):
+            entry = form.get(key)
+            if entry is not None:
+                entry.configure(show=show)
 
-    def toggle_no_token(self, index: int) -> None:
+    def update_auth_mode(self, index: int) -> None:
         form = self.endpoint_forms[index]
-        entry = form["token_entry"]
-        if entry is not None:
-            entry.configure(state="disabled" if form["no_token"].get() else "normal")
+        mode = self.form_auth_mode(form)
+        for widget in form.get("token_widgets", []):
+            if mode == AUTH_TOKEN:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        for widget in form.get("basic_widgets", []):
+            if mode == AUTH_BASIC:
+                widget.grid()
+            else:
+                widget.grid_remove()
+        for key in ("token_entry", "username_entry", "password_entry"):
+            entry = form.get(key)
+            if entry is not None:
+                entry.configure(state="normal")
         self.update_endpoint_warning(index)
 
     def collect_settings(self) -> tuple[list[dict], int] | None:
@@ -2092,7 +2192,10 @@ class SettingsWindow:
             name = form["name"].get().strip() or f"Endpoint {index + 1}"
             url = form["endpoint"].get().strip()
             token = form["token"].get().strip()
-            no_token = bool(form["no_token"].get())
+            username = form["username"].get().strip()
+            password = form["password"].get().strip()
+            auth_mode = self.form_auth_mode(form)
+            no_token = auth_mode == AUTH_NONE
             endpoint_enabled = bool(form["enabled"].get())
 
             if url and not endpoint_url_allowed(url):
@@ -2102,13 +2205,19 @@ class SettingsWindow:
                 )
                 return None
             if endpoint_enabled and url:
-                if not no_token and not token:
+                if auth_mode == AUTH_TOKEN and not token:
                     messagebox.showerror(
                         "Token required",
-                        f"Endpoint {index + 1} needs a token, or check No token.",
+                        f"Endpoint {index + 1} needs a bearer token, or choose a different authentication mode.",
                     )
                     return None
-                for _severity, warning in endpoint_security_warnings(url, no_token):
+                if auth_mode == AUTH_BASIC and (not username or not password):
+                    messagebox.showerror(
+                        "Username/password required",
+                        f"Endpoint {index + 1} needs both a username and password for username/password auth.",
+                    )
+                    return None
+                for _severity, warning in endpoint_security_warnings(url, auth_mode):
                     security_messages.append(f"Endpoint {index + 1}: {warning}")
                 active_count += 1
 
@@ -2117,8 +2226,11 @@ class SettingsWindow:
                     "name": name,
                     "endpoint": url,
                     "enabled": endpoint_enabled,
+                    "auth_mode": auth_mode,
                     "no_token": no_token,
-                    "token": "" if no_token else protect_secret(token),
+                    "token": protect_secret(token) if auth_mode == AUTH_TOKEN else "",
+                    "username": username if auth_mode == AUTH_BASIC else "",
+                    "password": protect_secret(password) if auth_mode == AUTH_BASIC else "",
                     "last_event_id": self.app.get_endpoint_state(index, "last_event_id"),
                     "last_fingerprint": self.app.get_endpoint_state(index, "last_fingerprint"),
                 }
@@ -2301,10 +2413,10 @@ class MassNotifyApp:
                 ok_count = 0
                 for index, endpoint_cfg in endpoints:
                     endpoint = safe_string(endpoint_cfg.get("endpoint"))
-                    token = "" if endpoint_cfg.get("no_token") else unprotect_secret(endpoint_cfg.get("token", ""))
+                    auth_headers = endpoint_auth_headers(endpoint_cfg)
                     fault_key = f"endpoint-{index}"
                     try:
-                        data, raw_text = fetch_endpoint(endpoint, token)
+                        data, raw_text = fetch_endpoint(endpoint, auth_headers)
                         ensure_api_ok(data)
                         alert = extract_alert(data, raw_text)
                         normalize_alert_urls(alert, endpoint)
@@ -2471,9 +2583,9 @@ class MassNotifyApp:
             first_alert: AlertData | None = None
             for index, endpoint_cfg in endpoints:
                 endpoint = safe_string(endpoint_cfg.get("endpoint"))
-                token = "" if endpoint_cfg.get("no_token") else unprotect_secret(endpoint_cfg.get("token", ""))
+                auth_headers = endpoint_auth_headers(endpoint_cfg)
                 try:
-                    data, raw_text = fetch_endpoint(endpoint, token)
+                    data, raw_text = fetch_endpoint(endpoint, auth_headers)
                     ensure_api_ok(data)
                     alert = extract_alert(data, raw_text)
                     normalize_alert_urls(alert, endpoint)

@@ -1,6 +1,6 @@
 # SouthlandServers Mass Notification App
 
-**Current version: V1.0.4**
+**Current version: V1.0.5-Beta**
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0A66C2)](#install)
 [![Python](https://img.shields.io/badge/built%20with-Python-3776AB)](#build-from-source)
@@ -22,7 +22,7 @@ It runs quietly in the background, starts with Windows if enabled, polls one or 
 | Weather alerts | Shows NWS/SIP NOTIFY-style alert screens with title, priority, severity, area, effective time, and until/expires time. |
 | Announcements | Shows a simplified safe-format notice with a hazard icon, title, and body only. |
 | Endpoints | Supports up to three independent HTTP/HTTPS endpoints, with red warnings for non-local HTTP. |
-| Tokens | Supports bearer tokens per endpoint, plus a `No token` mode for trusted direct endpoints. |
+| Authentication | Supports bearer token, no authentication, or username/password auth per endpoint. |
 | Startup | Can register itself to run automatically when Windows starts. |
 | Audio | Select bundled WAV tones from the `audio` folder, preview them, or import a custom WAV. |
 | Updates | Optional automatic update checks from GitHub Releases on startup and about every 15 minutes. |
@@ -65,7 +65,7 @@ The announcement window intentionally does not display endpoint internals, XML i
 
 ## Install
 
-Download the latest V1.0.4 installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
+Download the latest V1.0.5-Beta installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
 
 ```text
 SLS_Mass_Notify_Installer.exe
@@ -99,14 +99,14 @@ When Settings opens, configure at least one endpoint.
 
 1. Enable the endpoint tab you want to use.
 2. Enter the endpoint URL. HTTPS is recommended.
-3. Enter the bearer token/key, or check `No token` if the endpoint is designed to be called directly.
-4. Review any red HTTP or yellow no-token security warnings.
+3. Choose bearer token, no authentication, or username/password auth.
+4. Review any red HTTP or yellow no-auth security warnings.
 5. Choose the poll interval.
 6. Choose the alert audio tone or import your own `.wav`.
 7. Click `Test Active Endpoints`.
 8. Click `Save`.
 
-The app can monitor up to three endpoints at the same time. Each endpoint can have a different URL, token, enabled state, and no-token setting.
+The app can monitor up to three endpoints at the same time. Each endpoint can have a different URL, authentication mode, credential set, and enabled state.
 
 ## How It Works
 
@@ -135,7 +135,13 @@ Host: example.com
 Authorization: Bearer TOKENHERE
 ```
 
-If `No token` is checked, the app calls the endpoint without the `Authorization` header.
+If `No authentication` is selected, the app calls the endpoint without the `Authorization` header.
+
+For username/password endpoints, the app sends HTTP Basic authentication:
+
+```http
+Authorization: Basic BASE64_USERNAME_PASSWORD
+```
 
 The app stores the last seen `latest.id` for each endpoint. A notification appears only when that ID changes. If an endpoint does not provide an ID, the app falls back to a content fingerprint.
 
@@ -196,7 +202,7 @@ The app stores the last seen `latest.id` for each endpoint. A notification appea
 
 ## Custom Audio
 
-V1.0.4 keeps alert sounds in the `audio` folder. The default tone is:
+V1.0.5-Beta keeps alert sounds in the `audio` folder. The default tone is:
 
 ```text
 audio\Announcement.wav
@@ -220,7 +226,7 @@ Only `.wav` files under 25 MB are accepted for custom imports.
 
 - Endpoint URLs should use `https://`.
 - Non-local `http://` endpoints are allowed but show a red warning because they may be vulnerable to man-in-the-middle attacks.
-- `No token` endpoints show a yellow caution because requests may not be fully authenticated.
+- No-auth endpoints show a yellow caution because requests may not be fully authenticated.
 - Local tokens are encrypted with Windows DPAPI before being saved.
 - Settings are stored under:
 
@@ -301,7 +307,7 @@ dist\SLS_Mass_Notify_Installer.exe
 
 Before publishing a release:
 
-1. Confirm `APP_VERSION` is still `1.0.4` for this V1.0.4 release.
+1. Confirm `APP_VERSION` is still `1.0.5-Beta` for this V1.0.5-Beta release.
 2. Rebuild with `.\build-installer.ps1 -Clean`.
 3. Test install, Terms acceptance, settings save, endpoint warnings, audio selection/play/import, endpoint test, background startup, alert display, announcement display, uninstall, and update preference.
 4. Attach `dist\SLS_Mass_Notify_Installer.exe` to the GitHub Release.
@@ -309,7 +315,7 @@ Before publishing a release:
 
 ## Project Status
 
-V1.0.4 is suitable for controlled testing, demos, pilots, and small trusted deployments.
+V1.0.5-Beta is suitable for controlled testing, demos, pilots, and small trusted deployments.
 
 Recommended hardening before broad public production rollout:
 
