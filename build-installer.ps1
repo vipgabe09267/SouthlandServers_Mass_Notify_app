@@ -33,7 +33,6 @@ Write-Host "Building Program Files installer exe..." -ForegroundColor Green
     --clean `
     --onefile `
     --windowed `
-    --uac-admin `
     --name SLS_Mass_Notify_Installer `
     --icon "$ProjectRoot\favicon.ico" `
     --add-data "$AppExe;." `

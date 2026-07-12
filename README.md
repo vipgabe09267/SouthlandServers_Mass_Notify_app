@@ -1,6 +1,6 @@
 # SouthlandServers Mass Notification App
 
-**Current version: V1.0.5-Beta**
+**Current version: V1.0.6-Beta**
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0A66C2)](#install)
 [![Python](https://img.shields.io/badge/built%20with-Python-3776AB)](#build-from-source)
@@ -65,7 +65,7 @@ The announcement window intentionally does not display endpoint internals, XML i
 
 ## Install
 
-Download the latest V1.0.5-Beta installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
+Download the latest V1.0.6-Beta installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
 
 ```text
 SLS_Mass_Notify_Installer.exe
@@ -202,7 +202,7 @@ The app stores the last seen `latest.id` for each endpoint. A notification appea
 
 ## Custom Audio
 
-V1.0.5-Beta keeps alert sounds in the `audio` folder. The default tone is:
+V1.0.6-Beta keeps alert sounds in the `audio` folder. The default tone is:
 
 ```text
 audio\Announcement.wav
@@ -253,7 +253,9 @@ The updater watches GitHub Releases. When a newer published, non-draft release i
 SLS_Mass_Notify_Installer.exe
 ```
 
-Then it runs that installer in update mode. Because the app installs into Program Files, Windows may request administrator approval during updates.
+Release tags are compared with the running app version, including beta/RC ordering, so an older install updates even if it has never recorded a previous release ID. The download must come from this repository and match the SHA-256 digest published by GitHub before it can run.
+
+The installer is launched in update mode through the Windows elevation flow. Because the app installs into Program Files, Windows requests administrator approval before applying the update. Existing endpoint, audio, startup, and automatic-update preferences are preserved.
 
 ## Uninstall
 
@@ -307,7 +309,7 @@ dist\SLS_Mass_Notify_Installer.exe
 
 Before publishing a release:
 
-1. Confirm `APP_VERSION` is still `1.0.5-Beta` for this V1.0.5-Beta release.
+1. Confirm `APP_VERSION` is still `1.0.6-Beta` for this V1.0.6-Beta release.
 2. Rebuild with `.\build-installer.ps1 -Clean`.
 3. Test install, Terms acceptance, settings save, endpoint warnings, audio selection/play/import, endpoint test, background startup, alert display, announcement display, uninstall, and update preference.
 4. Attach `dist\SLS_Mass_Notify_Installer.exe` to the GitHub Release.
@@ -315,7 +317,7 @@ Before publishing a release:
 
 ## Project Status
 
-V1.0.5-Beta is suitable for controlled testing, demos, pilots, and small trusted deployments.
+V1.0.6-Beta is suitable for controlled testing, demos, pilots, and small trusted deployments.
 
 Recommended hardening before broad public production rollout:
 

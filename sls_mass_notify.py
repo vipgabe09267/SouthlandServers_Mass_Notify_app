@@ -20,12 +20,14 @@ import time
 import urllib.error
 import urllib.request
 from urllib.parse import urljoin, urlparse
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from tkinter import BooleanVar, Canvas, IntVar, StringVar, Text, Tk, Toplevel, filedialog, messagebox
 from tkinter import ttk
+
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 try:
     from PIL import Image, ImageTk
@@ -49,7 +51,7 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 COMPANY_NAME = "SouthlandServers"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.5-Beta"
+APP_VERSION = "1.0.6-Beta"
 IPC_HOST = "127.0.0.1"
 IPC_PORT = 48572
 DEFAULT_POLL_SECONDS = 10
@@ -57,7 +59,9 @@ MAX_ENDPOINTS = 3
 FAULT_NOTIFY_SECONDS = 5 * 60
 FAULT_TOAST_VISIBLE_MS = 18000
 ALERT_AUTO_HIDE_MS = 45000
+ALERT_IMAGE_WAIT_MS = 9000
 IMAGE_FETCH_LIMIT_BYTES = 5 * 1024 * 1024
+IMAGE_PIXEL_LIMIT = 20_000_000
 ALERT_FOOTER_TEXT = "Copyright \u00a9 Southland Servers Group"
 UPDATE_CHECK_SECONDS = 15 * 60
 UPDATE_RETRY_WAKE_SECONDS = 5 * 60
@@ -76,6 +80,7 @@ AUTH_LABELS = {
 GITHUB_OWNER = "vipgabe09267"
 GITHUB_REPO = "SouthlandServers_Mass_Notify_app"
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases?per_page=10"
+GITHUB_RELEASE_DOWNLOAD_PREFIX = f"/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/".lower()
 UPDATE_INSTALLER_ASSET_NAMES = ("SLS_Mass_Notify_Installer.exe",)
 
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / COMPANY_NAME / APP_SHORT_NAME
@@ -85,6 +90,13 @@ UPDATE_DIR = CONFIG_DIR / "updates"
 USER_AUDIO_DIR = CONFIG_DIR / AUDIO_DIR_NAME
 INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / COMPANY_NAME / APP_SHORT_NAME
 INSTALL_EXE_PATH = INSTALL_DIR / EXE_NAME
+POWERSHELL_EXE = (
+    Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    / "System32"
+    / "WindowsPowerShell"
+    / "v1.0"
+    / "powershell.exe"
+)
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 UNINSTALL_REG_PATH = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_SHORT_NAME}"
 START_MENU_DIR = (
@@ -596,7 +608,7 @@ def endpoint_display_name(index: int, endpoint: dict) -> str:
 
 def endpoint_url_allowed(url: str) -> bool:
     parsed = urlparse(url)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
+    if parsed.scheme in {"http", "https"} and parsed.hostname and parsed.username is None and parsed.password is None:
         return True
     return False
 
@@ -709,6 +721,7 @@ def default_config() -> dict:
         "last_update_release_id": "",
         "last_update_release_name": "",
         "last_update_release_tag": "",
+        "pending_update_release_id": "",
         "no_token": False,
         "poll_seconds": DEFAULT_POLL_SECONDS,
         "startup_enabled": True,
@@ -771,6 +784,50 @@ def safe_string(value: object) -> str:
         return json.dumps(value, ensure_ascii=False)
     except TypeError:
         return str(value)
+
+
+def parse_release_version(value: object) -> tuple[int, int, int, int, int] | None:
+    text = safe_string(value).strip()
+    match = re.search(
+        r"(?i)(?:^|[^0-9])v?(\d+)\.(\d+)\.(\d+)(?:[-_]?([a-z]+)(\d*))?",
+        text,
+    )
+    if not match:
+        return None
+    major, minor, patch = (int(match.group(index)) for index in (1, 2, 3))
+    prerelease = (match.group(4) or "").lower()
+    prerelease_number = int(match.group(5) or 0)
+    stage_rank = {
+        "dev": 0,
+        "alpha": 1,
+        "a": 1,
+        "beta": 2,
+        "b": 2,
+        "rc": 3,
+    }.get(prerelease, 1 if prerelease else 4)
+    return major, minor, patch, stage_rank, prerelease_number
+
+
+def compare_release_versions(candidate: object, current: object | None = None) -> int | None:
+    if current is None:
+        current = APP_VERSION
+    candidate_version = parse_release_version(candidate)
+    current_version = parse_release_version(current)
+    if candidate_version is None or current_version is None:
+        return None
+    return (candidate_version > current_version) - (candidate_version < current_version)
+
+
+def trusted_github_download_url(value: object) -> bool:
+    parsed = urlparse(safe_string(value))
+    return bool(
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").lower() == "github.com"
+        and parsed.port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.lower().startswith(GITHUB_RELEASE_DOWNLOAD_PREFIX)
+    )
 
 
 def lookup(obj: object, keys: set[str]) -> object | None:
@@ -866,7 +923,7 @@ def parse_yealink_payload(xml_text: str) -> PhonePayload:
         return phone
     try:
         root = ET.fromstring(xml_body.encode("utf-8"))
-    except ET.ParseError as exc:
+    except (ET.ParseError, DefusedXmlException) as exc:
         log(f"yealink xml parse failed: {exc}")
         return phone
 
@@ -1040,6 +1097,50 @@ class UnauthorizedError(ApiError):
     pass
 
 
+def request_origin(url: str) -> tuple[str, str, int | None]:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    return scheme, host, port
+
+
+class HttpSchemeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_scheme = urlparse(newurl).scheme.lower()
+        if new_scheme not in {"http", "https"}:
+            raise urllib.error.HTTPError(req.full_url, code, "Redirected to a non-HTTP URL", headers, fp)
+        if urlparse(req.full_url).scheme.lower() == "https" and urlparse(newurl).scheme.lower() != "https":
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                "Endpoint attempted an HTTPS downgrade; request blocked",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class SameOriginRedirectHandler(HttpSchemeRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if request_origin(req.full_url) != request_origin(newurl):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                "Endpoint redirected to a different origin; request blocked to protect credentials",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_http_request(request: urllib.request.Request, timeout: int):
+    opener = urllib.request.build_opener(HttpSchemeRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
 def endpoint_auth_headers(endpoint_cfg: dict) -> dict[str, str]:
     auth_mode = normalize_auth_mode(endpoint_cfg.get("auth_mode"), bool(endpoint_cfg.get("no_token")))
     if auth_mode == AUTH_NONE:
@@ -1064,8 +1165,9 @@ def fetch_endpoint(endpoint: str, auth_headers: dict[str, str] | None = None) ->
     }
     headers.update(auth_headers or {})
     request = urllib.request.Request(endpoint, headers=headers, method="GET")
+    opener = urllib.request.build_opener(SameOriginRedirectHandler())
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with opener.open(request, timeout=10) as response:
             content_type = response.headers.get("Content-Type", "")
             raw_bytes = response.read(1024 * 1024)
     except urllib.error.HTTPError as exc:
@@ -1126,6 +1228,14 @@ def normalize_alert_urls(alert: AlertData, endpoint: str) -> None:
 
 
 def fetch_image_bytes(image_url: str) -> bytes:
+    parsed = urlparse(image_url)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ApiError("Alert image URL must be an HTTP(S) URL without embedded credentials")
     request = urllib.request.Request(
         image_url,
         headers={
@@ -1134,7 +1244,7 @@ def fetch_image_bytes(image_url: str) -> bytes:
         },
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=8) as response:
+    with open_http_request(request, timeout=8) as response:
         data = response.read(IMAGE_FETCH_LIMIT_BYTES + 1)
     if len(data) > IMAGE_FETCH_LIMIT_BYTES:
         raise ApiError("Image response was too large")
@@ -1151,7 +1261,7 @@ def fetch_latest_github_release() -> dict:
         },
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=12) as response:
+    with open_http_request(request, timeout=12) as response:
         raw_bytes = response.read(1024 * 512)
     data = json.loads(raw_bytes.decode("utf-8"))
     if not isinstance(data, list):
@@ -1164,19 +1274,19 @@ def fetch_latest_github_release() -> dict:
         if not isinstance(assets, list):
             continue
         selected_asset = None
+        expected_asset_names = {name.lower() for name in UPDATE_INSTALLER_ASSET_NAMES}
         for asset in assets:
             if not isinstance(asset, dict):
                 continue
             name = safe_string(asset.get("name"))
-            if name in UPDATE_INSTALLER_ASSET_NAMES or name.lower().endswith("_installer.exe"):
+            if name.lower() in expected_asset_names:
                 selected_asset = asset
                 break
         if selected_asset is None:
             continue
 
         download_url = safe_string(selected_asset.get("browser_download_url"))
-        parsed = urlparse(download_url)
-        if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+        if not trusted_github_download_url(download_url):
             raise ApiError("Release installer asset did not provide a trusted GitHub download URL")
 
         release_id = safe_string(release.get("id")) or safe_string(release.get("tag_name"))
@@ -1189,6 +1299,7 @@ def fetch_latest_github_release() -> dict:
             "published_at": safe_string(release.get("published_at")),
             "asset_name": safe_string(selected_asset.get("name")),
             "asset_size": int(selected_asset.get("size") or 0),
+            "asset_digest": safe_string(selected_asset.get("digest")),
             "download_url": download_url,
         }
 
@@ -1199,8 +1310,7 @@ def download_update_installer(release: dict) -> Path:
     release_id = safe_string(release.get("id"))
     download_url = safe_string(release.get("download_url"))
     asset_name = safe_string(release.get("asset_name")) or "SLS_Mass_Notify_Installer.exe"
-    parsed = urlparse(download_url)
-    if not release_id or parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+    if not release_id or not trusted_github_download_url(download_url):
         raise ApiError("Invalid update release metadata")
     UPDATE_DIR.mkdir(parents=True, exist_ok=True)
     safe_release_id = re.sub(r"[^A-Za-z0-9_.-]", "_", release_id)[:80]
@@ -1214,7 +1324,7 @@ def download_update_installer(release: dict) -> Path:
         },
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=45) as response:
+    with open_http_request(request, timeout=45) as response:
         with temp_path.open("wb") as fh:
             total = 0
             while True:
@@ -1226,6 +1336,7 @@ def download_update_installer(release: dict) -> Path:
                     raise ApiError("Downloaded update installer was too large")
                 fh.write(chunk)
     expected_size = int(release.get("asset_size") or 0)
+    expected_digest = safe_string(release.get("asset_digest")).lower()
     actual_size = temp_path.stat().st_size
     if actual_size < 5 * 1024 * 1024:
         try:
@@ -1239,19 +1350,59 @@ def download_update_installer(release: dict) -> Path:
         except OSError:
             pass
         raise ApiError("Downloaded update installer size did not match the GitHub release asset")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_digest):
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise ApiError("GitHub release asset did not include a valid SHA-256 digest")
+    digest = hashlib.sha256()
+    with temp_path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual_digest = digest.hexdigest()
+    if actual_digest != expected_digest.removeprefix("sha256:"):
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise ApiError("Downloaded update installer failed SHA-256 verification")
     temp_path.replace(installer_path)
     return installer_path
 
 
-def launch_update_installer(installer_path: Path) -> None:
+def launch_update_installer(installer_path: Path, install_dir: Path | None = None) -> None:
     if not installer_path.exists():
         raise ApiError(f"Update installer is missing: {installer_path}")
-    subprocess.Popen(
-        [str(installer_path), "--silent", "--update"],
-        cwd=str(installer_path.parent),
-        close_fds=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    if install_dir is None and getattr(sys, "frozen", False):
+        install_dir = Path(sys.executable).resolve().parent
+    arguments = ["--silent", "--update"]
+    if install_dir is not None:
+        arguments.extend(["--install-dir", str(install_dir.resolve())])
+    if is_windows():
+        shell_execute = ctypes.windll.shell32.ShellExecuteW
+        shell_execute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+        ]
+        shell_execute.restype = ctypes.c_void_p
+        result = shell_execute(
+            None,
+            "runas",
+            str(installer_path),
+            subprocess.list2cmdline(arguments),
+            str(installer_path.parent),
+            1,
+        )
+        result_code = int(result or 0)
+        if result_code <= 32:
+            raise ApiError(f"Windows did not start the update installer (ShellExecute error {result_code})")
+        return
+    subprocess.Popen([str(installer_path), *arguments], cwd=str(installer_path.parent))
 
 
 def play_alert_sound(audio_name: str = DEFAULT_AUDIO_NAME) -> None:
@@ -1314,7 +1465,12 @@ class AlertWindow:
         self.app = app
         self.alert = alert
         self.image_refs = []
+        self._revealed = False
+        self._image_pending = False
+        self._image_results: queue.Queue[bytes | None] = queue.Queue(maxsize=1)
+        self._after_ids: set[str] = set()
         self.window = Toplevel(app.root)
+        self.window.withdraw()
         self.window.title("SLS Mass Notify Alert")
         self.window.resizable(False, False)
         self.window.configure(bg="#111111")
@@ -1362,11 +1518,22 @@ class AlertWindow:
         self.canvas.bind("<Button-3>", lambda _event: self.show_raw_xml())
 
         self._place_notification()
-        self.window.lift()
-        self.window.focus_force()
-        self.window.after(750, self._drop_topmost)
-        self.window.after(ALERT_AUTO_HIDE_MS, self.hide)
-        self._load_screen_image()
+        self._image_pending = self._load_screen_image()
+        if self._image_pending:
+            self._schedule(ALERT_IMAGE_WAIT_MS, self._finish_image_load)
+        else:
+            self._reveal()
+
+    def _schedule(self, delay_ms: int, callback) -> str:
+        after_id = ""
+
+        def run_callback() -> None:
+            self._after_ids.discard(after_id)
+            callback()
+
+        after_id = self.window.after(delay_ms, run_callback)
+        self._after_ids.add(after_id)
+        return after_id
 
     def _set_icon(self, window: Toplevel) -> None:
         icon = resource_path("favicon.ico")
@@ -1579,22 +1746,45 @@ class AlertWindow:
             font=("Segoe UI", 22),
         )
 
-    def _load_screen_image(self) -> None:
+    def _load_screen_image(self) -> bool:
         if self._is_announcement():
-            return
+            return False
         image_url = resolve_image_url(self.alert.image_url, self.alert.source_endpoint)
         if not image_url:
-            return
+            return False
 
         def worker() -> None:
             try:
                 image_bytes = fetch_image_bytes(image_url)
             except Exception as exc:
                 log(f"alert image fetch failed: {exc}")
-                return
-            self.app.root.after(0, lambda: self._show_screen_image(image_bytes))
+                image_bytes = None
+            try:
+                self._image_results.put_nowait(image_bytes)
+            except queue.Full:
+                pass
 
         threading.Thread(target=worker, name="AlertImageLoader", daemon=True).start()
+        self._schedule(40, self._poll_image_result)
+        return True
+
+    def _poll_image_result(self) -> None:
+        if not self.window.winfo_exists() or not self._image_pending:
+            return
+        try:
+            image_bytes = self._image_results.get_nowait()
+        except queue.Empty:
+            self._schedule(40, self._poll_image_result)
+            return
+        self._finish_image_load(image_bytes)
+
+    def _finish_image_load(self, image_bytes: bytes | None = None) -> None:
+        if not self.window.winfo_exists() or not self._image_pending:
+            return
+        self._image_pending = False
+        if image_bytes:
+            self._show_screen_image(image_bytes)
+        self._reveal()
 
     def _show_screen_image(self, image_bytes: bytes) -> None:
         import tkinter as tk
@@ -1603,7 +1793,11 @@ class AlertWindow:
             return
         try:
             if Image is not None and ImageTk is not None:
-                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                source = Image.open(io.BytesIO(image_bytes))
+                if source.width * source.height > IMAGE_PIXEL_LIMIT:
+                    raise ValueError("alert image dimensions are too large")
+                image = source.convert("RGB")
+                source.close()
                 image = image.resize((self.SCREEN_W, self.SCREEN_H), Image.Resampling.LANCZOS)
                 display = ImageTk.PhotoImage(image)
                 self.image_refs = [display]
@@ -1620,6 +1814,17 @@ class AlertWindow:
         self.canvas.create_rectangle(sx, sy, sx + sw, sy + sh, fill="#111111", outline="#f0a7a7", width=2)
         self.canvas.create_image(sx, sy, image=display, anchor="nw")
         self.canvas.create_rectangle(sx, sy, sx + sw, sy + sh, outline="#f0a7a7", width=2)
+
+    def _reveal(self) -> None:
+        if self._revealed or not self.window.winfo_exists():
+            return
+        self._revealed = True
+        self._place_notification()
+        self.window.deiconify()
+        self.window.lift()
+        self.window.focus_force()
+        self._schedule(750, self._drop_topmost)
+        self._schedule(ALERT_AUTO_HIDE_MS, self.hide)
 
     def _fit_photo_to_screen(self, photo):
         width = photo.width()
@@ -1640,13 +1845,15 @@ class AlertWindow:
 
     def _place_notification(self) -> None:
         self.window.update_idletasks()
-        width = self.window.winfo_width()
-        height = self.window.winfo_height()
+        # A withdrawn Toplevel reports Tk's temporary 200x200 size. Center the
+        # requested final dimensions so mapping the window cannot shift it.
+        width = max(self.CANVAS_W, self.window.winfo_reqwidth())
+        height = max(self.CANVAS_H, self.window.winfo_reqheight())
         screen_w = self.window.winfo_screenwidth()
         screen_h = self.window.winfo_screenheight()
         x = max(12, int((screen_w - width) / 2))
         y = max(12, int((screen_h - height) / 2))
-        self.window.geometry(f"+{x}+{y}")
+        self.window.geometry(f"{width}x{height}+{x}+{y}")
 
     def _drop_topmost(self) -> None:
         if self.window.winfo_exists():
@@ -1656,7 +1863,7 @@ class AlertWindow:
                 pass
 
     def _handle_focus_out(self, _event) -> None:
-        self.window.after(140, self._lower_if_unfocused)
+        self._schedule(140, self._lower_if_unfocused)
 
     def _lower_if_unfocused(self) -> None:
         if not self.window.winfo_exists():
@@ -1671,6 +1878,13 @@ class AlertWindow:
 
     def hide(self) -> None:
         if self.window.winfo_exists():
+            self._image_pending = False
+            for after_id in tuple(self._after_ids):
+                try:
+                    self.window.after_cancel(after_id)
+                except Exception:
+                    pass
+            self._after_ids.clear()
             self.window.destroy()
 
     def show_raw_xml(self) -> None:
@@ -1810,6 +2024,11 @@ class SettingsWindow:
         self.audio_var = StringVar(value=safe_audio_name(safe_string(cfg.get("audio_sound")) or DEFAULT_AUDIO_NAME))
         self.audio_combo: ttk.Combobox | None = None
         self.endpoint_forms: list[dict] = []
+        self.endpoint_panels: list[ttk.Frame] = []
+        self.endpoint_buttons: list[ttk.Button] = []
+        self.selected_endpoint_index = 0
+        self.logo_image = None
+        self.monitor_badge: ttk.Label | None = None
 
         self._build(cfg)
         self.window.update_idletasks()
@@ -1820,52 +2039,87 @@ class SettingsWindow:
     def _set_initial_geometry(self) -> None:
         screen_w = self.window.winfo_screenwidth()
         screen_h = self.window.winfo_screenheight()
-        width = max(940, min(1120, screen_w - 80))
-        height = max(680, min(820, screen_h - 120))
+        width = max(940, min(1140, screen_w - 80))
+        height = max(680, min(840, screen_h - 100))
         self.window.geometry(f"{width}x{height}")
         self.window.minsize(900, 640)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self.window)
-        for theme in ("clam", "vista", "xpnative"):
-            if theme in style.theme_names():
-                try:
-                    style.theme_use(theme)
-                    break
-                except Exception:
-                    pass
-        self.window.configure(bg="#f7f9fc")
-        style.configure(".", background="#f7f9fc", foreground="#101828", font=("Segoe UI", 9))
-        style.configure("Surface.TFrame", background="#f7f9fc")
-        style.configure("Card.TFrame", background="#ffffff", relief="flat")
-        style.configure("Header.TFrame", background="#0f172a")
-        style.configure("Header.TLabel", background="#0f172a", foreground="#ffffff", font=("Segoe UI", 20, "bold"))
-        style.configure("HeaderHint.TLabel", background="#0f172a", foreground="#cbd5e1", font=("Segoe UI", 9))
-        style.configure("Section.TLabel", background="#ffffff", foreground="#101828", font=("Segoe UI", 12, "bold"))
-        style.configure("Hint.TLabel", background="#ffffff", foreground="#667085", font=("Segoe UI", 9))
-        style.configure("Status.TLabel", background="#f7f9fc", foreground="#475467", font=("Segoe UI", 9))
-        style.configure("RedWarning.TLabel", background="#ffffff", foreground="#b42318", font=("Segoe UI", 9, "bold"))
-        style.configure("YellowWarning.TLabel", background="#ffffff", foreground="#9a6700", font=("Segoe UI", 9, "bold"))
-        style.configure("TCheckbutton", background="#ffffff", foreground="#102033")
-        style.configure("TEntry", fieldbackground="#ffffff")
-        style.configure("Accent.TButton", background="#2563eb", foreground="#ffffff", font=("Segoe UI", 9, "bold"), padding=(14, 7))
-        style.map("Accent.TButton", background=[("active", "#1d4ed8"), ("pressed", "#1e40af")])
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        page = "#f3f6f7"
+        surface = "#ffffff"
+        inset = "#f7faf9"
+        ink = "#152522"
+        muted = "#60716d"
+        accent = "#087f70"
+        accent_hover = "#06695e"
+        border = "#d9e3e0"
+
+        self.window.configure(bg=page)
+        style.configure(".", background=page, foreground=ink, font=("Segoe UI", 10))
+        style.configure("Surface.TFrame", background=page)
+        style.configure("Card.TFrame", background=surface, borderwidth=1, relief="solid")
+        style.configure("Inset.TFrame", background=inset)
+        style.configure("Header.TFrame", background="#173b36")
+        style.configure("Header.TLabel", background="#173b36", foreground="#ffffff", font=("Segoe UI Semibold", 22))
+        style.configure("HeaderHint.TLabel", background="#173b36", foreground="#cde4df", font=("Segoe UI", 10))
+        style.configure("Version.TLabel", background="#173b36", foreground="#91d8ca", font=("Segoe UI Semibold", 9))
+        style.configure("BadgeOn.TLabel", background="#d6f4eb", foreground="#076652", font=("Segoe UI Semibold", 9), padding=(10, 5))
+        style.configure("BadgeOff.TLabel", background="#e7eceb", foreground="#52615e", font=("Segoe UI Semibold", 9), padding=(10, 5))
+        style.configure("Section.TLabel", background=surface, foreground=ink, font=("Segoe UI Semibold", 13))
+        style.configure("Field.TLabel", background=inset, foreground=ink, font=("Segoe UI", 9))
+        style.configure("Hint.TLabel", background=surface, foreground=muted, font=("Segoe UI", 9))
+        style.configure("InsetHint.TLabel", background=inset, foreground=muted, font=("Segoe UI", 9))
+        style.configure("StatusBar.TFrame", background=surface)
+        style.configure("Status.TLabel", background=surface, foreground=muted, font=("Segoe UI", 9))
+        style.configure("RedWarning.TLabel", background=inset, foreground="#b42318", font=("Segoe UI Semibold", 9))
+        style.configure("YellowWarning.TLabel", background=inset, foreground="#9a6700", font=("Segoe UI Semibold", 9))
+        style.configure("Card.TCheckbutton", background=surface, foreground=ink, padding=(0, 3))
+        style.map("Card.TCheckbutton", background=[("active", surface)])
+        style.configure("Inset.TCheckbutton", background=inset, foreground=ink, padding=(0, 3))
+        style.map("Inset.TCheckbutton", background=[("active", inset)])
+        style.configure("TEntry", fieldbackground=surface, bordercolor=border, lightcolor=border, darkcolor=border, padding=(8, 6))
+        style.configure("TCombobox", fieldbackground=surface, bordercolor=border, lightcolor=border, darkcolor=border, padding=(6, 5))
+        style.configure("TSpinbox", fieldbackground=surface, bordercolor=border, lightcolor=border, darkcolor=border, padding=(6, 5))
+        style.configure("TButton", background="#edf2f1", foreground=ink, borderwidth=0, padding=(13, 8), font=("Segoe UI Semibold", 9))
+        style.map("TButton", background=[("active", "#e0e9e7"), ("pressed", "#d5e1df")])
+        style.configure("Accent.TButton", background=accent, foreground="#ffffff", padding=(16, 9), font=("Segoe UI Semibold", 9))
+        style.map("Accent.TButton", background=[("active", accent_hover), ("pressed", "#05564d")], foreground=[("disabled", "#d8e3e1")])
+        style.configure("Endpoint.TButton", background="#edf2f1", foreground="#4a5c58", padding=(14, 8))
+        style.configure("EndpointSelected.TButton", background="#d8f1eb", foreground="#08695b", padding=(14, 8))
+        style.map("EndpointSelected.TButton", background=[("active", "#cae9e2")])
+        style.configure("Horizontal.TProgressbar", background=accent, troughcolor="#dfe8e6", borderwidth=0)
 
     def _build(self, cfg: dict) -> None:
         self.window.rowconfigure(1, weight=1)
         self.window.columnconfigure(0, weight=1)
 
-        header = ttk.Frame(self.window, padding=(22, 18), style="Header.TFrame")
+        header = ttk.Frame(self.window, padding=(26, 20), style="Header.TFrame")
         header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(header, text="SLS Mass Notify App", style="Header.TLabel").pack(anchor="w")
+        title_block = ttk.Frame(header, style="Header.TFrame")
+        title_block.pack(side="left", fill="x", expand=True)
+        ttk.Label(title_block, text="SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
-            header,
-            text="Mass notification monitoring, endpoint authentication, audio, and startup behavior.",
+            title_block,
+            text="Reliable desktop delivery for Southland Servers alerts and announcements",
             style="HeaderHint.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(anchor="w", pady=(3, 0))
+        header_meta = ttk.Frame(header, style="Header.TFrame")
+        header_meta.pack(side="right", anchor="ne")
+        ttk.Label(header_meta, text=f"VERSION {APP_VERSION}", style="Version.TLabel").pack(anchor="e", pady=(0, 7))
+        enabled = bool(self.enabled_var.get())
+        self.monitor_badge = ttk.Label(
+            header_meta,
+            text="MONITORING ON" if enabled else "MONITORING OFF",
+            style="BadgeOn.TLabel" if enabled else "BadgeOff.TLabel",
+        )
+        self.monitor_badge.pack(anchor="e")
 
         content = ttk.Frame(self.window, style="Surface.TFrame")
-        content.grid(row=1, column=0, sticky="nsew", padx=18, pady=(16, 10))
+        content.grid(row=1, column=0, sticky="nsew", padx=22, pady=(18, 12))
 
         def make_scroll_area(parent: ttk.Frame) -> ttk.Frame:
             parent.rowconfigure(0, weight=1)
@@ -1896,9 +2150,9 @@ class SettingsWindow:
                 return "break"
 
             def bind_mousewheel(widget):
-                widget.bind("<MouseWheel>", on_mousewheel, add="+")
-                widget.bind("<Button-4>", on_scroll_up, add="+")
-                widget.bind("<Button-5>", on_scroll_down, add="+")
+                widget.bind("<MouseWheel>", on_mousewheel)
+                widget.bind("<Button-4>", on_scroll_up)
+                widget.bind("<Button-5>", on_scroll_down)
                 for child in widget.winfo_children():
                     bind_mousewheel(child)
 
@@ -1914,92 +2168,112 @@ class SettingsWindow:
 
         mass_frame = make_scroll_area(content)
 
-        general = ttk.Frame(mass_frame, padding=18, style="Card.TFrame")
-        general.pack(fill="x", pady=(0, 14))
-        ttk.Label(general, text="General", style="Section.TLabel").grid(row=0, column=0, columnspan=5, sticky="w")
+        overview = ttk.Frame(mass_frame, style="Surface.TFrame")
+        overview.pack(fill="x", pady=(0, 16))
+        overview.columnconfigure(0, weight=1, uniform="overview")
+        overview.columnconfigure(1, weight=1, uniform="overview")
+
+        general = ttk.Frame(overview, padding=20, style="Card.TFrame")
+        general.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ttk.Label(general, text="App behavior", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(
             general,
-            text="Choose how the background monitor runs on this Windows user profile.",
+            text="Control monitoring, startup, updates, and how often endpoints are checked.",
             style="Hint.TLabel",
-        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 12))
-        ttk.Checkbutton(general, text="Enable background monitoring", variable=self.enabled_var).grid(
-            row=2, column=0, sticky="w", padx=(0, 18), pady=(0, 8)
+            wraplength=430,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 13))
+        ttk.Checkbutton(general, text="Enable background monitoring", variable=self.enabled_var, style="Card.TCheckbutton").grid(
+            row=2, column=0, columnspan=4, sticky="w"
         )
-        ttk.Checkbutton(general, text="Run at Windows startup", variable=self.startup_var).grid(
-            row=2, column=1, sticky="w", padx=(0, 18), pady=(0, 8)
+        ttk.Checkbutton(general, text="Run at Windows startup", variable=self.startup_var, style="Card.TCheckbutton").grid(
+            row=3, column=0, columnspan=4, sticky="w"
         )
         ttk.Checkbutton(
             general,
-            text="Automatically install new GitHub Release updates",
+            text="Automatically install verified release updates",
             variable=self.auto_update_var,
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        ttk.Label(
-            general,
-            text="Checks shortly after startup and about every 15 minutes while running. Updates download the published installer asset and may request Windows admin approval.",
-            style="Hint.TLabel",
-        ).grid(row=4, column=0, columnspan=5, sticky="w", pady=(0, 10))
-        ttk.Label(general, text="Poll every", background="#ffffff").grid(row=5, column=0, sticky="w", padx=(0, 6))
+            style="Card.TCheckbutton",
+        ).grid(row=4, column=0, columnspan=4, sticky="w")
+        ttk.Label(general, text="Polling interval", style="Hint.TLabel").grid(row=5, column=0, sticky="w", pady=(13, 3))
         ttk.Spinbox(general, from_=5, to=3600, textvariable=self.interval_var, width=7).grid(
-            row=5, column=1, sticky="w"
+            row=6, column=0, sticky="w"
         )
-        ttk.Label(general, text="seconds", background="#ffffff").grid(row=5, column=2, sticky="w", padx=(6, 0))
-        general.columnconfigure(5, weight=1)
+        ttk.Label(general, text="seconds", style="Hint.TLabel").grid(row=6, column=1, sticky="w", padx=(8, 0))
+        general.columnconfigure(3, weight=1)
 
-        audio = ttk.Frame(mass_frame, padding=18, style="Card.TFrame")
-        audio.pack(fill="x", pady=(0, 14))
+        audio = ttk.Frame(overview, padding=20, style="Card.TFrame")
+        audio.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         ttk.Label(audio, text="Alert Audio", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(
             audio,
-            text="Choose the WAV file to play once when a new alert or announcement appears.",
+            text="Select the WAV sound that plays once when a new notification arrives.",
             style="Hint.TLabel",
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 10))
-        self.audio_combo = ttk.Combobox(audio, textvariable=self.audio_var, values=list_audio_choices(), state="readonly", width=36)
-        self.audio_combo.grid(row=2, column=0, sticky="ew", padx=(0, 8))
-        ttk.Button(audio, text="Play", command=self.play_selected_audio).grid(row=2, column=1, sticky="w", padx=(0, 8))
-        ttk.Button(audio, text="Import WAV", command=self.import_audio).grid(row=2, column=2, sticky="w")
+            wraplength=430,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 15))
+        ttk.Label(audio, text="Notification sound", style="Hint.TLabel").grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        self.audio_combo = ttk.Combobox(audio, textvariable=self.audio_var, values=list_audio_choices(), state="readonly", width=32)
+        self.audio_combo.grid(row=3, column=0, columnspan=4, sticky="ew")
+        audio_actions = ttk.Frame(audio, style="Card.TFrame")
+        audio_actions.grid(row=4, column=0, columnspan=4, sticky="w", pady=(11, 0))
+        ttk.Button(audio_actions, text="Play sound", command=self.play_selected_audio).pack(side="left", padx=(0, 8))
+        ttk.Button(audio_actions, text="Import WAV", command=self.import_audio).pack(side="left")
         ttk.Label(
             audio,
-            text="Bundled audio lives in the audio folder. Imported WAV files are copied to your app settings folder.",
+            text="Imported files stay in your protected app settings folder.",
             style="Hint.TLabel",
-        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(12, 0))
         audio.columnconfigure(0, weight=1)
         self.refresh_audio_choices()
 
-        endpoints_frame = ttk.Frame(mass_frame, padding=18, style="Card.TFrame")
+        endpoints_frame = ttk.Frame(mass_frame, padding=20, style="Card.TFrame")
         endpoints_frame.pack(fill="both", expand=True, pady=(0, 12))
-        ttk.Label(endpoints_frame, text="Alert Endpoints", style="Section.TLabel").pack(anchor="w")
+        endpoint_heading = ttk.Frame(endpoints_frame, style="Card.TFrame")
+        endpoint_heading.pack(fill="x")
+        ttk.Label(endpoint_heading, text="Notification endpoints", style="Section.TLabel").pack(side="left", anchor="w")
+        ttk.Label(endpoint_heading, text="Up to 3 sources", style="Hint.TLabel").pack(side="right", anchor="e")
         ttk.Label(
             endpoints_frame,
-            text="Each active endpoint can use bearer token, username/password, or no authentication for trusted direct endpoints.",
+            text="Configure each alert source independently. Credentials are protected with Windows DPAPI.",
             style="Hint.TLabel",
-        ).pack(anchor="w", pady=(2, 12))
-        for index, endpoint in enumerate(normalize_endpoints(cfg)):
-            group = ttk.Frame(endpoints_frame, padding=12, style="Card.TFrame")
-            group.pack(fill="x", pady=(0, 12 if index < MAX_ENDPOINTS - 1 else 0))
-            ttk.Label(group, text=f"Endpoint {index + 1}", style="Section.TLabel").grid(
-                row=0, column=0, columnspan=3, sticky="w", pady=(0, 8)
-            )
-            self._build_endpoint_tab(group, index, endpoint)
+        ).pack(anchor="w", pady=(3, 14))
 
-        ttk.Separator(self.window).grid(row=2, column=0, sticky="ew", pady=(2, 0))
-        footer = ttk.Frame(self.window, padding=(2, 0), style="Surface.TFrame")
-        footer.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 12))
-        footer.columnconfigure(0, weight=1)  # Status expands
-        
-        # Status label on left side
+        selector = ttk.Frame(endpoints_frame, style="Card.TFrame")
+        selector.pack(fill="x", pady=(0, 12))
+        panel_host = ttk.Frame(endpoints_frame, style="Inset.TFrame", padding=18)
+        panel_host.pack(fill="both", expand=True)
+        panel_host.columnconfigure(0, weight=1)
+        for index, endpoint in enumerate(normalize_endpoints(cfg)):
+            button = ttk.Button(
+                selector,
+                text=f"Endpoint {index + 1}",
+                style="EndpointSelected.TButton" if index == 0 else "Endpoint.TButton",
+                command=lambda idx=index: self.show_endpoint(idx),
+            )
+            button.pack(side="left", padx=(0, 8))
+            self.endpoint_buttons.append(button)
+            group = ttk.Frame(panel_host, style="Inset.TFrame")
+            group.grid(row=0, column=0, sticky="nsew")
+            self.endpoint_panels.append(group)
+            self._build_endpoint_tab(group, index, endpoint)
+            if index != 0:
+                group.grid_remove()
+
+        footer = ttk.Frame(self.window, padding=(22, 12), style="StatusBar.TFrame")
+        footer.grid(row=2, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
         self.status_label = ttk.Label(
             footer,
             text=self.app.status_text,
             style="Status.TLabel",
-            wraplength=520,
+            wraplength=500,
         )
         self.status_label.grid(row=0, column=0, sticky="ew", padx=(0, 12))
 
-        actions = ttk.Frame(footer)
+        actions = ttk.Frame(footer, style="StatusBar.TFrame")
         actions.grid(row=0, column=1, sticky="e")
-        ttk.Button(actions, text="Test Active", command=self.test_now).pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="Save", style="Accent.TButton", command=self.save).pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="Close", command=self.close).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="Test endpoints", command=self.test_now).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Save changes", style="Accent.TButton", command=self.save).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Close", command=self.close).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="Quit App", command=self.quit_app).pack(side="left")
 
 
@@ -2019,13 +2293,20 @@ class SettingsWindow:
             "password_entry": None,
             "token_widgets": [],
             "basic_widgets": [],
+            "show_secrets_widget": None,
+            "auth_hint_label": None,
             "warning_label": None,
         }
         self.endpoint_forms.append(form)
 
         row_offset = 1
-        ttk.Checkbutton(parent, text="Enabled", variable=form["enabled"]).grid(row=row_offset, column=0, sticky="w")
-        ttk.Label(parent, text="Authentication", background="#ffffff").grid(row=row_offset, column=1, sticky="e", padx=(18, 8))
+        ttk.Label(parent, text=f"Endpoint {index + 1} configuration", style="Field.TLabel", font=("Segoe UI Semibold", 11)).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
+        )
+        ttk.Checkbutton(parent, text="Enabled", variable=form["enabled"], style="Inset.TCheckbutton").grid(
+            row=row_offset, column=0, sticky="w"
+        )
+        ttk.Label(parent, text="Authentication", style="Field.TLabel").grid(row=row_offset, column=1, sticky="e", padx=(18, 8))
         auth_combo = ttk.Combobox(
             parent,
             textvariable=form["auth_mode"],
@@ -2035,52 +2316,58 @@ class SettingsWindow:
         )
         auth_combo.grid(row=row_offset, column=2, sticky="w")
         auth_combo.bind("<<ComboboxSelected>>", lambda _event, idx=index: self.update_auth_mode(idx))
-        ttk.Checkbutton(
+        show_secrets = ttk.Checkbutton(
             parent,
             text="Show secrets",
             variable=form["show_token"],
             command=lambda idx=index: self.toggle_token(idx),
-        ).grid(row=row_offset, column=3, sticky="w", padx=(18, 0))
+            style="Inset.TCheckbutton",
+        )
+        show_secrets.grid(row=row_offset, column=3, sticky="w", padx=(18, 0))
+        form["show_secrets_widget"] = show_secrets
 
-        ttk.Label(parent, text="Name", background="#ffffff").grid(row=row_offset + 1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(parent, text="Display name", style="Field.TLabel").grid(row=row_offset + 1, column=0, sticky="w", pady=(14, 0))
         ttk.Entry(parent, textvariable=form["name"], width=24).grid(
-            row=row_offset + 2, column=0, sticky="ew", pady=(3, 0), padx=(0, 10)
+            row=row_offset + 2, column=0, sticky="ew", pady=(4, 0), padx=(0, 10)
         )
 
-        ttk.Label(parent, text="Endpoint URL", background="#ffffff").grid(
-            row=row_offset + 1, column=1, columnspan=3, sticky="w", pady=(10, 0)
+        ttk.Label(parent, text="Endpoint URL", style="Field.TLabel").grid(
+            row=row_offset + 1, column=1, columnspan=3, sticky="w", pady=(14, 0)
         )
         ttk.Entry(parent, textvariable=form["endpoint"], width=64).grid(
-            row=row_offset + 2, column=1, columnspan=3, sticky="ew", pady=(3, 0), padx=(0, 10)
+            row=row_offset + 2, column=1, columnspan=3, sticky="ew", pady=(4, 0)
         )
 
-        token_label = ttk.Label(parent, text="Authorization token / key", background="#ffffff")
+        token_label = ttk.Label(parent, text="Bearer token", style="Field.TLabel")
         token_label.grid(
-            row=row_offset + 3, column=0, columnspan=4, sticky="w", pady=(10, 0)
+            row=row_offset + 3, column=0, columnspan=4, sticky="w", pady=(14, 0)
         )
         token_entry = ttk.Entry(parent, textvariable=form["token"], width=80, show="*")
-        token_entry.grid(row=row_offset + 4, column=0, columnspan=4, sticky="ew", pady=(3, 0), padx=(0, 10))
+        token_entry.grid(row=row_offset + 4, column=0, columnspan=4, sticky="ew", pady=(4, 0))
         form["token_entry"] = token_entry
         form["token_widgets"] = [token_label, token_entry]
 
-        username_label = ttk.Label(parent, text="Username", background="#ffffff")
-        username_label.grid(row=row_offset + 3, column=0, sticky="w", pady=(10, 0))
+        username_label = ttk.Label(parent, text="Username", style="Field.TLabel")
+        username_label.grid(row=row_offset + 3, column=0, sticky="w", pady=(14, 0))
         username_entry = ttk.Entry(parent, textvariable=form["username"], width=28)
-        username_entry.grid(row=row_offset + 4, column=0, sticky="ew", pady=(3, 0), padx=(0, 10))
+        username_entry.grid(row=row_offset + 4, column=0, sticky="ew", pady=(4, 0), padx=(0, 10))
         form["username_entry"] = username_entry
-        password_label = ttk.Label(parent, text="Password", background="#ffffff")
-        password_label.grid(row=row_offset + 3, column=1, sticky="w", pady=(10, 0))
+        password_label = ttk.Label(parent, text="Password", style="Field.TLabel")
+        password_label.grid(row=row_offset + 3, column=1, sticky="w", pady=(14, 0))
         password_entry = ttk.Entry(parent, textvariable=form["password"], width=36, show="*")
-        password_entry.grid(row=row_offset + 4, column=1, columnspan=3, sticky="ew", pady=(3, 0), padx=(0, 10))
+        password_entry.grid(row=row_offset + 4, column=1, columnspan=3, sticky="ew", pady=(4, 0))
         form["password_entry"] = password_entry
         form["basic_widgets"] = [username_label, username_entry, password_label, password_entry]
-        ttk.Label(
+        auth_hint = ttk.Label(
             parent,
             text="Bearer token uses Authorization: Bearer. Username/password uses HTTP Basic auth. No authentication sends no Authorization header.",
-            style="Hint.TLabel",
-        ).grid(row=row_offset + 5, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        warning_label = ttk.Label(parent, text="", style="Hint.TLabel", wraplength=780)
-        warning_label.grid(row=row_offset + 6, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            style="InsetHint.TLabel",
+            wraplength=820,
+        )
+        auth_hint.grid(row=row_offset + 5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        form["auth_hint_label"] = auth_hint
+        warning_label = ttk.Label(parent, text="", style="InsetHint.TLabel", wraplength=820)
+        warning_label.grid(row=row_offset + 6, column=0, columnspan=4, sticky="w", pady=(7, 0))
         form["warning_label"] = warning_label
         parent.columnconfigure(0, weight=1)
         parent.columnconfigure(1, weight=1)
@@ -2089,6 +2376,18 @@ class SettingsWindow:
         form["endpoint"].trace_add("write", lambda *_args, idx=index: self.update_endpoint_warning(idx))
         form["auth_mode"].trace_add("write", lambda *_args, idx=index: self.update_auth_mode(idx))
         self.update_auth_mode(index)
+
+    def show_endpoint(self, index: int) -> None:
+        if not 0 <= index < len(self.endpoint_panels):
+            return
+        self.selected_endpoint_index = index
+        for panel_index, panel in enumerate(self.endpoint_panels):
+            if panel_index == index:
+                panel.grid()
+            else:
+                panel.grid_remove()
+        for button_index, button in enumerate(self.endpoint_buttons):
+            button.configure(style="EndpointSelected.TButton" if button_index == index else "Endpoint.TButton")
 
     def _center(self) -> None:
         width = self.window.winfo_width()
@@ -2138,7 +2437,7 @@ class SettingsWindow:
         auth_mode = self.form_auth_mode(form)
         warnings = endpoint_security_warnings(form["endpoint"].get().strip(), auth_mode)
         if not warnings:
-            label.configure(text="Security status: endpoint/auth settings look normal.", style="Hint.TLabel")
+            label.configure(text="Security status: endpoint and authentication settings look normal.", style="InsetHint.TLabel")
             return
         severity, _message = warnings[0]
         text = "\n".join(message for _severity, message in warnings)
@@ -2172,6 +2471,20 @@ class SettingsWindow:
                 widget.grid()
             else:
                 widget.grid_remove()
+        show_secrets = form.get("show_secrets_widget")
+        if show_secrets is not None:
+            if mode == AUTH_NONE:
+                show_secrets.grid_remove()
+            else:
+                show_secrets.grid()
+        auth_hint = form.get("auth_hint_label")
+        if auth_hint is not None:
+            hints = {
+                AUTH_TOKEN: "The token is sent as an Authorization: Bearer header and stored with Windows DPAPI.",
+                AUTH_BASIC: "The username and password are sent with HTTP Basic authentication. Use HTTPS to protect them in transit.",
+                AUTH_NONE: "No Authorization header will be sent. Use this only for a trusted endpoint designed for anonymous access.",
+            }
+            auth_hint.configure(text=hints[mode])
         for key in ("token_entry", "username_entry", "password_entry"):
             entry = form.get(key)
             if entry is not None:
@@ -2261,7 +2574,14 @@ class SettingsWindow:
             poll_seconds=interval,
             audio_sound=safe_audio_name(self.audio_var.get() or DEFAULT_AUDIO_NAME),
         )
-        self.status_label.configure(text="Saved. Monitoring will use the active endpoint tabs.")
+        if self.monitor_badge is not None:
+            enabled = bool(self.enabled_var.get())
+            self.monitor_badge.configure(
+                text="MONITORING ON" if enabled else "MONITORING OFF",
+                style="BadgeOn.TLabel" if enabled else "BadgeOff.TLabel",
+            )
+        active_count = sum(bool(form["enabled"].get() and form["endpoint"].get().strip()) for form in self.endpoint_forms)
+        self.status_label.configure(text=f"Settings saved. {active_count} endpoint{'s' if active_count != 1 else ''} active.")
         return True
 
     def test_now(self) -> None:
@@ -2481,6 +2801,18 @@ class MassNotifyApp:
             if self.stop_event.wait(UPDATE_RETRY_WAKE_SECONDS):
                 break
 
+    def record_current_release(self, release: dict) -> None:
+        with self.config_lock:
+            self.config["last_update_release_id"] = safe_string(release.get("id"))
+            self.config["last_update_release_name"] = (
+                safe_string(release.get("name")) or safe_string(release.get("tag_name"))
+            )
+            self.config["last_update_release_tag"] = safe_string(release.get("tag_name"))
+            self.config["pending_update_release_id"] = ""
+            self.config["last_update_error"] = ""
+            self.config = normalize_config(self.config)
+            save_config(self.config)
+
     def check_for_updates_if_due(self) -> None:
         with self.config_lock:
             cfg = normalize_config(dict(self.config))
@@ -2502,35 +2834,35 @@ class MassNotifyApp:
             latest_release = fetch_latest_github_release()
             release_id = safe_string(latest_release.get("id"))
             release_name = safe_string(latest_release.get("name")) or safe_string(latest_release.get("tag_name"))
+            release_tag = safe_string(latest_release.get("tag_name"))
+            version_comparison = compare_release_versions(release_tag, APP_VERSION)
             with self.config_lock:
                 current_release_id = safe_string(self.config.get("last_update_release_id"))
                 if not current_release_id:
                     current_release_id = safe_string(self.config.get("last_update_commit"))
-            if not current_release_id:
-                with self.config_lock:
-                    self.config["last_update_release_id"] = release_id
-                    self.config["last_update_release_name"] = release_name
-                    self.config["last_update_release_tag"] = safe_string(latest_release.get("tag_name"))
-                    self.config["last_update_error"] = ""
-                    self.config = normalize_config(self.config)
-                    save_config(self.config)
-                log(f"auto update baseline set to GitHub release {release_name or release_id}")
+
+            if version_comparison is not None and version_comparison <= 0:
+                self.record_current_release(latest_release)
+                log(f"auto update check OK: app {APP_VERSION} is current for {release_tag or release_id}")
                 return
-            if release_id == current_release_id:
+            if version_comparison != 1 and release_id == current_release_id:
                 log(f"auto update check OK: already at tracked release {release_name or release_id}")
+                return
+            if version_comparison != 1 and not current_release_id:
+                self.record_current_release(latest_release)
+                log(f"auto update baseline set to GitHub release {release_name or release_id}")  # nosec B608
                 return
 
             log(f"auto update found release {release_name or release_id}; downloading installer")
             installer_path = download_update_installer(latest_release)
+            log(f"requesting elevation for update installer: {installer_path}")
+            launch_update_installer(installer_path)
             with self.config_lock:
-                self.config["last_update_release_id"] = release_id
-                self.config["last_update_release_name"] = release_name
-                self.config["last_update_release_tag"] = safe_string(latest_release.get("tag_name"))
+                self.config["pending_update_release_id"] = release_id
                 self.config["last_update_error"] = ""
                 self.config = normalize_config(self.config)
                 save_config(self.config)
-            log(f"launching update installer: {installer_path}")
-            launch_update_installer(installer_path)
+            log(f"update installer launched for {release_name or release_id}")
         except Exception as exc:
             message = safe_string(exc)
             with self.config_lock:
@@ -2626,37 +2958,55 @@ def launch_uninstall_cleanup(remove_settings: bool) -> None:
     try:
         cleanup_dir = Path(tempfile.gettempdir()) / f"{APP_SHORT_NAME}_uninstall_{os.getpid()}"
         cleanup_dir.mkdir(parents=True, exist_ok=True)
-        cleanup_script = cleanup_dir / "finish_uninstall.cmd"
-        lines = [
-            "@echo off",
-            "setlocal",
-            f"set APP_PID={os.getpid()}",
-            ":wait_for_app",
-            'tasklist /FI "PID eq %APP_PID%" 2>nul | findstr /R /C:"%APP_PID%" >nul',
-            "if not errorlevel 1 (",
-            "  timeout /t 1 /nobreak >nul",
-            "  goto wait_for_app",
-            ")",
-            f'taskkill /IM "{EXE_NAME}" /F >nul 2>nul',
-            "timeout /t 1 /nobreak >nul",
-            f'del /F /Q "{START_MENU_APP_SHORTCUT}" >nul 2>nul',
-            f'del /F /Q "{START_MENU_UNINSTALL_SHORTCUT}" >nul 2>nul',
-            f'rmdir "{START_MENU_DIR}" >nul 2>nul',
-            f'rmdir /S /Q "{INSTALL_DIR}" >nul 2>nul',
-        ]
-        if remove_settings:
-            lines.append(f'rmdir /S /Q "{CONFIG_DIR}" >nul 2>nul')
-        lines.extend(
-            [
-                f'rmdir "{CONFIG_DIR.parent}" >nul 2>nul',
-                f'rmdir "{INSTALL_DIR.parent}" >nul 2>nul',
-                f'del /F /Q "{cleanup_script}" >nul 2>nul',
-                "endlocal",
-            ]
+        cleanup_script = cleanup_dir / "finish_uninstall.ps1"
+        parameters_path = cleanup_dir / "parameters.json"
+        parameters_path.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "install_dir": str(INSTALL_DIR.resolve()),
+                    "install_parent": str(INSTALL_DIR.resolve().parent),
+                    "remove_settings": bool(remove_settings),
+                    "config_dir": str(CONFIG_DIR.resolve()),
+                    "config_parent": str(CONFIG_DIR.resolve().parent),
+                }
+            ),
+            encoding="utf-8",
         )
-        cleanup_script.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+        cleanup_script.write_text(
+            r'''param([Parameter(Mandatory=$true)][string]$ParametersPath)
+$ErrorActionPreference = "SilentlyContinue"
+$parameters = Get-Content -LiteralPath $ParametersPath -Raw | ConvertFrom-Json
+for ($attempt = 0; $attempt -lt 240; $attempt++) {
+    if (-not (Get-Process -Id ([int]$parameters.pid) -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 500
+}
+Remove-Item -LiteralPath ([string]$parameters.install_dir) -Recurse -Force
+if ([bool]$parameters.remove_settings) {
+    Remove-Item -LiteralPath ([string]$parameters.config_dir) -Recurse -Force
+}
+foreach ($parent in @([string]$parameters.install_parent, [string]$parameters.config_parent)) {
+    if ((Test-Path -LiteralPath $parent) -and -not (Get-ChildItem -LiteralPath $parent -Force | Select-Object -First 1)) {
+        Remove-Item -LiteralPath $parent -Force
+    }
+}
+$cleanupRoot = Split-Path -Parent $ParametersPath
+Remove-Item -LiteralPath $cleanupRoot -Recurse -Force
+''',
+            encoding="utf-8",
+        )
         subprocess.Popen(
-            ["cmd.exe", "/c", str(cleanup_script)],
+            [
+                str(POWERSHELL_EXE),
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(cleanup_script),
+                "-ParametersPath",
+                str(parameters_path),
+            ],
             cwd=tempfile.gettempdir(),
             close_fds=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),

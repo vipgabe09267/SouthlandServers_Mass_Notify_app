@@ -24,7 +24,7 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 INSTALLER_EXE_NAME = "SLS_Mass_Notify_Uninstall.exe"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.5-Beta"
+APP_VERSION = "1.0.6-Beta"
 AUDIO_DIR_NAME = "audio"
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 UNINSTALL_REG_PATH = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_SHORT_NAME}"
@@ -42,6 +42,13 @@ The app stores local settings under the current Windows user profile and protect
 This software is provided under the GNU Affero General Public License v3.0 without warranty. You agree to test deployments before operational use and to comply with all applicable laws, policies, and emergency communication requirements."""
 
 PROGRAM_FILES = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+POWERSHELL_EXE = (
+    Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    / "System32"
+    / "WindowsPowerShell"
+    / "v1.0"
+    / "powershell.exe"
+)
 DEFAULT_INSTALL_DIR = PROGRAM_FILES / COMPANY_DISPLAY_NAME / "SLS Mass Notify"
 START_MENU_DIR = (
     Path(os.environ.get("ProgramData", r"C:\ProgramData"))
@@ -134,6 +141,27 @@ def set_startup_enabled(enabled: bool, app_path: Path) -> None:
                 winreg.DeleteValue(key, APP_SHORT_NAME)
             except FileNotFoundError:
                 pass
+
+
+def startup_entry_enabled() -> bool:
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_REG_PATH, 0, winreg.KEY_READ) as key:
+            value, _ = winreg.QueryValueEx(key, APP_SHORT_NAME)
+        return bool(str(value).strip())
+    except OSError:
+        return False
+
+
+def command_line_value(name: str) -> str:
+    try:
+        index = sys.argv.index(name)
+    except ValueError:
+        return ""
+    if index + 1 >= len(sys.argv):
+        return ""
+    return str(sys.argv[index + 1]).strip()
 
 
 def remove_legacy_entries() -> None:
@@ -341,34 +369,55 @@ def install_app(
 def launch_cleanup(install_dir: Path, remove_settings: bool) -> None:
     cleanup_dir = Path(tempfile.gettempdir()) / f"{APP_SHORT_NAME}_uninstall_{os.getpid()}"
     cleanup_dir.mkdir(parents=True, exist_ok=True)
-    cleanup_script = cleanup_dir / "finish_uninstall.cmd"
-    lines = [
-        "@echo off",
-        "setlocal",
-        f"set UNINSTALLER_PID={os.getpid()}",
-        ":wait_for_uninstaller",
-        'tasklist /FI "PID eq %UNINSTALLER_PID%" 2>nul | findstr /R /C:"%UNINSTALLER_PID%" >nul',
-        "if not errorlevel 1 (",
-        "  timeout /t 1 /nobreak >nul",
-        "  goto wait_for_uninstaller",
-        ")",
-        f'taskkill /IM "{EXE_NAME}" /F >nul 2>nul',
-        "timeout /t 1 /nobreak >nul",
-        f'rmdir /S /Q "{install_dir}" >nul 2>nul',
-        f'rmdir "{install_dir.parent}" >nul 2>nul',
-    ]
-    if remove_settings:
-        lines.append(f'rmdir /S /Q "{CONFIG_DIR}" >nul 2>nul')
-        lines.append(f'rmdir "{CONFIG_DIR.parent}" >nul 2>nul')
-    lines.extend(
-        [
-            f'rmdir "{cleanup_dir}" >nul 2>nul',
-            "endlocal",
-        ]
+    cleanup_script = cleanup_dir / "finish_uninstall.ps1"
+    parameters_path = cleanup_dir / "parameters.json"
+    parameters_path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "install_dir": str(install_dir.resolve()),
+                "install_parent": str(install_dir.resolve().parent),
+                "remove_settings": bool(remove_settings),
+                "config_dir": str(CONFIG_DIR.resolve()),
+                "config_parent": str(CONFIG_DIR.resolve().parent),
+            }
+        ),
+        encoding="utf-8",
     )
-    cleanup_script.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    cleanup_script.write_text(
+        r'''param([Parameter(Mandatory=$true)][string]$ParametersPath)
+$ErrorActionPreference = "SilentlyContinue"
+$parameters = Get-Content -LiteralPath $ParametersPath -Raw | ConvertFrom-Json
+for ($attempt = 0; $attempt -lt 240; $attempt++) {
+    if (-not (Get-Process -Id ([int]$parameters.pid) -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 500
+}
+Remove-Item -LiteralPath ([string]$parameters.install_dir) -Recurse -Force
+if ([bool]$parameters.remove_settings) {
+    Remove-Item -LiteralPath ([string]$parameters.config_dir) -Recurse -Force
+}
+foreach ($parent in @([string]$parameters.install_parent, [string]$parameters.config_parent)) {
+    if ((Test-Path -LiteralPath $parent) -and -not (Get-ChildItem -LiteralPath $parent -Force | Select-Object -First 1)) {
+        Remove-Item -LiteralPath $parent -Force
+    }
+}
+$cleanupRoot = Split-Path -Parent $ParametersPath
+Remove-Item -LiteralPath $cleanupRoot -Recurse -Force
+''',
+        encoding="utf-8",
+    )
     subprocess.Popen(
-        ["cmd.exe", "/c", str(cleanup_script)],
+        [
+            str(POWERSHELL_EXE),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(cleanup_script),
+            "-ParametersPath",
+            str(parameters_path),
+        ],
         cwd=tempfile.gettempdir(),
         close_fds=True,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -415,11 +464,36 @@ def uninstall_app(
         messagebox.showinfo(APP_DISPLAY_NAME, "Uninstall started. The app files will be removed in a moment.")
 
 
+def configure_modern_style(root: Tk) -> None:
+    style = ttk.Style(root)
+    if "clam" in style.theme_names():
+        style.theme_use("clam")
+    root.configure(bg="#f3f6f7")
+    style.configure(".", background="#f3f6f7", foreground="#152522", font=("Segoe UI", 10))
+    style.configure("Page.TFrame", background="#f3f6f7")
+    style.configure("Card.TFrame", background="#ffffff", borderwidth=1, relief="solid")
+    style.configure("Header.TFrame", background="#173b36")
+    style.configure("Header.TLabel", background="#173b36", foreground="#ffffff", font=("Segoe UI Semibold", 21))
+    style.configure("HeaderHint.TLabel", background="#173b36", foreground="#cde4df", font=("Segoe UI", 10))
+    style.configure("Section.TLabel", background="#ffffff", foreground="#152522", font=("Segoe UI Semibold", 12))
+    style.configure("Hint.TLabel", background="#ffffff", foreground="#60716d", font=("Segoe UI", 9))
+    style.configure("Status.TLabel", background="#ffffff", foreground="#52645f", font=("Segoe UI", 9))
+    style.configure("Card.TCheckbutton", background="#ffffff", foreground="#152522", padding=(0, 3))
+    style.map("Card.TCheckbutton", background=[("active", "#ffffff")])
+    style.configure("TEntry", fieldbackground="#ffffff", bordercolor="#d9e3e0", padding=(8, 6))
+    style.configure("TButton", background="#edf2f1", foreground="#152522", borderwidth=0, padding=(13, 8), font=("Segoe UI Semibold", 9))
+    style.map("TButton", background=[("active", "#e0e9e7"), ("pressed", "#d5e1df")])
+    style.configure("Accent.TButton", background="#087f70", foreground="#ffffff", borderwidth=0, padding=(17, 9), font=("Segoe UI Semibold", 9))
+    style.map("Accent.TButton", background=[("active", "#06695e"), ("pressed", "#05564d")], foreground=[("disabled", "#d8e3e1")])
+    style.configure("Horizontal.TProgressbar", background="#087f70", troughcolor="#dfe8e6", borderwidth=0)
+
+
 class InstallerWindow:
     def __init__(self) -> None:
         self.root = Tk()
         self.root.title(f"{APP_DISPLAY_NAME} Setup")
         self.root.resizable(False, False)
+        configure_modern_style(self.root)
         icon = resource_path("favicon.ico")
         if icon.exists():
             try:
@@ -441,62 +515,108 @@ class InstallerWindow:
         self._center()
 
     def _build(self) -> None:
-        frame = ttk.Frame(self.root, padding=18)
-        frame.grid(row=0, column=0, sticky="nsew")
-        ttk.Label(frame, text=APP_DISPLAY_NAME, font=("Segoe UI", 14, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8)
-        )
+        self.root.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(self.root, padding=(26, 16), style="Header.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text="Install SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
-            frame,
-            text="Install the background notification app into Program Files.",
-            foreground="#555555",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 16))
+            header,
+            text=f"Southland Servers desktop notification client  |  Version {APP_VERSION}",
+            style="HeaderHint.TLabel",
+        ).pack(anchor="w", pady=(3, 0))
 
-        ttk.Label(frame, text="Install folder").grid(row=2, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.install_dir, width=72).grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(3, 12)
-        )
-        ttk.Button(frame, text="Browse", command=self.browse).grid(row=3, column=2, sticky="ew", padx=(8, 0), pady=(3, 12))
+        frame = ttk.Frame(self.root, padding=(18, 14), style="Page.TFrame")
+        frame.grid(row=1, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(frame, text="Run at Windows startup", variable=self.startup).grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(0, 6)
+        options = ttk.Frame(frame, padding=16, style="Card.TFrame")
+        options.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        options.columnconfigure(0, weight=1)
+        ttk.Label(options, text="Installation", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(options, text="Choose where the app is installed and how it starts.", style="Hint.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(3, 12)
         )
-        ttk.Checkbutton(frame, text="Open settings after install", variable=self.launch).grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=(0, 6)
+        ttk.Label(options, text="Install folder", style="Hint.TLabel").grid(row=2, column=0, columnspan=3, sticky="w")
+        ttk.Entry(options, textvariable=self.install_dir, width=48).grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(4, 12)
+        )
+        ttk.Button(options, text="Browse", command=self.browse).grid(row=3, column=2, sticky="ew", padx=(8, 0), pady=(4, 12))
+        ttk.Checkbutton(options, text="Run at Windows startup", variable=self.startup, style="Card.TCheckbutton").grid(
+            row=4, column=0, columnspan=3, sticky="w"
+        )
+        ttk.Checkbutton(options, text="Open settings after install", variable=self.launch, style="Card.TCheckbutton").grid(
+            row=5, column=0, columnspan=3, sticky="w"
         )
         ttk.Checkbutton(
-            frame,
-            text="Automatically install new GitHub Release updates",
+            options,
+            text="Automatically install verified GitHub Release updates",
             variable=self.auto_update,
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 6))
+            style="Card.TCheckbutton",
+        ).grid(row=6, column=0, columnspan=3, sticky="w")
 
-        ttk.Label(frame, text="Terms of Service", font=("Segoe UI", 9, "bold")).grid(
-            row=7, column=0, columnspan=3, sticky="w", pady=(8, 3)
+        terms = ttk.Frame(frame, padding=16, style="Card.TFrame")
+        terms.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        terms.columnconfigure(0, weight=1)
+        ttk.Label(terms, text="Terms of Service", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(terms, text="Review and accept the terms before installation.", style="Hint.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(3, 9)
         )
-        terms_box = Text(frame, width=86, height=8, wrap="word", state="normal")
+        terms_box = Text(
+            terms,
+            width=50,
+            height=10,
+            wrap="word",
+            state="normal",
+            font=("Segoe UI", 9),
+            bg="#f7faf9",
+            fg="#334640",
+            relief="flat",
+            padx=10,
+            pady=9,
+            highlightthickness=1,
+            highlightbackground="#d9e3e0",
+        )
         terms_box.insert("1.0", TERMS_TEXT)
         terms_box.configure(state="disabled")
-        terms_box.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        terms_box.grid(row=2, column=0, sticky="ew")
         ttk.Checkbutton(
-            frame,
+            terms,
             text="I accept the Terms of Service",
             variable=self.accept_terms,
             command=self.update_install_button_state,
-        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            style="Card.TCheckbutton",
+        ).grid(row=3, column=0, sticky="w", pady=(9, 0))
 
-        self.progressbar = ttk.Progressbar(frame, mode="indeterminate")
-        self.progressbar.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(8, 8))
-        self.log_box = Text(frame, width=86, height=8, wrap="word", state="disabled")
-        self.log_box.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(0, 14))
-
-        ttk.Separator(frame).grid(row=12, column=0, columnspan=3, sticky="ew", pady=(0, 12))
-        ttk.Label(frame, textvariable=self.status, foreground="#444444").grid(
-            row=13, column=0, sticky="w"
+        progress = ttk.Frame(frame, padding=14, style="Card.TFrame")
+        progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        progress.columnconfigure(0, weight=1)
+        self.progressbar = ttk.Progressbar(progress, mode="indeterminate")
+        self.progressbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 9))
+        self.log_box = Text(
+            progress,
+            width=100,
+            height=3,
+            wrap="word",
+            state="disabled",
+            font=("Consolas", 8),
+            bg="#f7faf9",
+            fg="#3e514c",
+            relief="flat",
+            padx=9,
+            pady=7,
+            highlightthickness=1,
+            highlightbackground="#d9e3e0",
         )
-        self.cancel_button = ttk.Button(frame, text="Cancel", command=self.root.destroy)
-        self.cancel_button.grid(row=13, column=1, sticky="e", padx=(0, 8))
-        self.install_button = ttk.Button(frame, text="Install", command=self.install)
-        self.install_button.grid(row=13, column=2, sticky="e")
+        self.log_box.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        ttk.Label(progress, textvariable=self.status, style="Status.TLabel").grid(row=2, column=0, sticky="w")
+        actions = ttk.Frame(frame, style="Page.TFrame")
+        actions.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        self.cancel_button = ttk.Button(actions, text="Cancel", command=self.root.destroy)
+        self.cancel_button.pack(side="left", padx=(0, 8))
+        self.install_button = ttk.Button(actions, text="Install now", style="Accent.TButton", command=self.install)
+        self.install_button.pack(side="left")
         self.update_install_button_state()
 
     def update_install_button_state(self) -> None:
@@ -571,6 +691,7 @@ class UninstallerWindow:
         self.root = Tk()
         self.root.title(f"{APP_DISPLAY_NAME} Uninstall")
         self.root.resizable(False, False)
+        configure_modern_style(self.root)
         icon = resource_path("favicon.ico")
         if icon.exists():
             try:
@@ -590,32 +711,54 @@ class UninstallerWindow:
             self.root.after(350, self.uninstall)
 
     def _build(self, auto_start: bool) -> None:
-        frame = ttk.Frame(self.root, padding=18)
-        frame.grid(row=0, column=0, sticky="nsew")
-        ttk.Label(frame, text=f"Uninstall {APP_DISPLAY_NAME}", font=("Segoe UI", 13, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8)
+        self.root.columnconfigure(0, weight=1)
+        header = ttk.Frame(self.root, padding=(26, 20), style="Header.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text="Uninstall SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(header, text="Remove the app and its Windows integration", style="HeaderHint.TLabel").pack(
+            anchor="w", pady=(3, 0)
         )
+
+        page = ttk.Frame(self.root, padding=22, style="Page.TFrame")
+        page.grid(row=1, column=0, sticky="nsew")
+        frame = ttk.Frame(page, padding=18, style="Card.TFrame")
+        frame.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(frame, text="Removal options", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(
             frame,
-            text="This will stop the background app, remove startup, remove Start Menu shortcuts, and remove Program Files app files.",
-            foreground="#555555",
-            wraplength=640,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 12))
+            text="The app will be stopped and removed from Program Files, startup, the Start Menu, and Windows Apps.",
+            style="Hint.TLabel",
+            wraplength=650,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 12))
         ttk.Checkbutton(
             frame,
             text="Remove saved endpoint settings and tokens",
             variable=self.remove_settings,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 10))
+            style="Card.TCheckbutton",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
         self.progressbar = ttk.Progressbar(frame, mode="indeterminate")
         self.progressbar.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
-        self.log_box = Text(frame, width=86, height=7, wrap="word", state="disabled")
+        self.log_box = Text(
+            frame,
+            width=86,
+            height=7,
+            wrap="word",
+            state="disabled",
+            font=("Consolas", 8),
+            bg="#f7faf9",
+            fg="#3e514c",
+            relief="flat",
+            padx=9,
+            pady=7,
+            highlightthickness=1,
+            highlightbackground="#d9e3e0",
+        )
         self.log_box.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 14))
-        ttk.Separator(frame).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 12))
-        ttk.Label(frame, textvariable=self.status, foreground="#444444").grid(row=6, column=0, sticky="w")
+        ttk.Label(frame, textvariable=self.status, style="Status.TLabel").grid(row=6, column=0, sticky="w")
         self.cancel_button = ttk.Button(frame, text="Cancel", command=self.root.destroy)
         self.cancel_button.grid(row=6, column=1, sticky="e", padx=(0, 8))
-        self.uninstall_button = ttk.Button(frame, text="Uninstall", command=self.uninstall)
+        self.uninstall_button = ttk.Button(frame, text="Uninstall", style="Accent.TButton", command=self.uninstall)
         self.uninstall_button.grid(row=6, column=2, sticky="e")
         if auto_start and self.uninstall_button is not None:
             self.uninstall_button.configure(state="disabled")
@@ -686,9 +829,11 @@ def main() -> None:
     if "--silent" in sys.argv:
         if not is_admin() and relaunch_as_admin():
             return
+        requested_install_dir = command_line_value("--install-dir")
+        install_dir = Path(requested_install_dir).resolve() if requested_install_dir else DEFAULT_INSTALL_DIR
         install_app(
-            DEFAULT_INSTALL_DIR,
-            startup=True,
+            install_dir,
+            startup=startup_entry_enabled(),
             launch=True,
             remove_legacy=True,
             auto_update=None,
