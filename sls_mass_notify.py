@@ -8,9 +8,11 @@ import io
 import json
 import os
 import queue
+import random
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -51,11 +53,27 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 COMPANY_NAME = "SouthlandServers"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.6-Beta"
+APP_VERSION = "1.0.7-Beta"
 IPC_HOST = "127.0.0.1"
 IPC_PORT = 48572
 DEFAULT_POLL_SECONDS = 10
 MAX_ENDPOINTS = 3
+DELIVERY_LIVE = "live_sse"
+DELIVERY_POLL = "legacy_polling"
+DELIVERY_LABELS = {
+    DELIVERY_LIVE: "Live handshake (v0.0.7-beta or newer only)",
+    DELIVERY_POLL: "Legacy polling fallback (v0.0.6-beta or older only)",
+}
+PBX_LIVE_PATH = "/api/sipnotify/desktop/stream"
+PBX_POLL_PATH = "/api/sipnotify/desktop"
+SSE_CONNECT_TIMEOUT_SECONDS = 25
+SSE_TEST_TIMEOUT_SECONDS = 12
+SSE_READ_TIMEOUT_SECONDS = 330
+LIVE_CATCHUP_SECONDS = 5
+SSE_MAX_LINE_BYTES = 64 * 1024
+SSE_MAX_EVENT_BYTES = 512 * 1024
+RECENT_EVENT_ID_LIMIT = 100
+RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30)
 FAULT_NOTIFY_SECONDS = 5 * 60
 FAULT_TOAST_VISIBLE_MS = 18000
 ALERT_AUTO_HIDE_MS = 45000
@@ -427,6 +445,81 @@ class DataBlob(ctypes.Structure):
     ]
 
 
+class WindowsCredential(ctypes.Structure):
+    _fields_ = [
+        ("Flags", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
+        ("TargetName", wintypes.LPWSTR),
+        ("Comment", wintypes.LPWSTR),
+        ("LastWritten", wintypes.FILETIME),
+        ("CredentialBlobSize", wintypes.DWORD),
+        ("CredentialBlob", ctypes.POINTER(wintypes.BYTE)),
+        ("Persist", wintypes.DWORD),
+        ("AttributeCount", wintypes.DWORD),
+        ("Attributes", ctypes.c_void_p),
+        ("TargetAlias", wintypes.LPWSTR),
+        ("UserName", wintypes.LPWSTR),
+    ]
+
+
+CRED_TYPE_GENERIC = 1
+CRED_PERSIST_LOCAL_MACHINE = 2
+CREDENTIAL_TARGET_PREFIX = f"{COMPANY_NAME}/{APP_SHORT_NAME}"
+
+
+def profile_credential_target(index: int, kind: str) -> str:
+    safe_kind = "password" if kind == "password" else "token"
+    return f"{CREDENTIAL_TARGET_PREFIX}/pbx-{index + 1}/{safe_kind}"
+
+
+def _write_windows_credential(target: str, secret: str) -> None:
+    blob = secret.encode("utf-16-le")
+    buffer = (wintypes.BYTE * len(blob)).from_buffer_copy(blob)
+    credential = WindowsCredential()
+    credential.Type = CRED_TYPE_GENERIC
+    credential.TargetName = target
+    credential.CredentialBlobSize = len(blob)
+    credential.CredentialBlob = ctypes.cast(buffer, ctypes.POINTER(wintypes.BYTE))
+    credential.Persist = CRED_PERSIST_LOCAL_MACHINE
+    credential.UserName = APP_SHORT_NAME
+    advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
+    advapi32.CredWriteW.argtypes = [ctypes.POINTER(WindowsCredential), wintypes.DWORD]
+    advapi32.CredWriteW.restype = wintypes.BOOL
+    if not advapi32.CredWriteW(ctypes.byref(credential), 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _read_windows_credential(target: str) -> str:
+    credential_ptr = ctypes.POINTER(WindowsCredential)()
+    advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
+    advapi32.CredReadW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.POINTER(WindowsCredential)),
+    ]
+    advapi32.CredReadW.restype = wintypes.BOOL
+    advapi32.CredFree.argtypes = [ctypes.c_void_p]
+    if not advapi32.CredReadW(target, CRED_TYPE_GENERIC, 0, ctypes.byref(credential_ptr)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        credential = credential_ptr.contents
+        blob = ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)
+        return blob.decode("utf-16-le")
+    finally:
+        advapi32.CredFree(credential_ptr)
+
+
+def _delete_windows_credential(target: str) -> None:
+    advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
+    advapi32.CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
+    advapi32.CredDeleteW.restype = wintypes.BOOL
+    if not advapi32.CredDeleteW(target, CRED_TYPE_GENERIC, 0):
+        error = ctypes.get_last_error()
+        if error != 1168:  # ERROR_NOT_FOUND
+            raise ctypes.WinError(error)
+
+
 def _protect_with_dpapi(secret: str) -> str:
     data = secret.encode("utf-8")
     in_buffer = ctypes.create_string_buffer(data)
@@ -469,10 +562,48 @@ def protect_secret(secret: str) -> str:
     return "plain:" + base64.b64encode(secret.encode("utf-8")).decode("ascii")
 
 
+def protect_profile_secret(index: int, kind: str, secret: str) -> str:
+    target = profile_credential_target(index, kind)
+    if not secret:
+        delete_profile_secret(index, kind)
+        return ""
+    if is_windows():
+        try:
+            _write_windows_credential(target, secret)
+            return "cred:" + target
+        except Exception as exc:
+            log(f"Windows Credential Manager write failed; using DPAPI fallback: {exc}")
+    return protect_secret(secret)
+
+
+def delete_profile_secret(index: int, kind: str) -> None:
+    if not is_windows():
+        return
+    try:
+        _delete_windows_credential(profile_credential_target(index, kind))
+    except Exception as exc:
+        log(f"Windows Credential Manager cleanup failed: {exc}")
+
+
+def delete_all_profile_secrets() -> None:
+    for index in range(MAX_ENDPOINTS):
+        delete_profile_secret(index, "token")
+        delete_profile_secret(index, "password")
+
+
 def unprotect_secret(value: str) -> str:
     if not value:
         return ""
-    if not value.startswith(("dpapi:", "plain:")):
+    if value.startswith("cred:") and is_windows():
+        target = value.removeprefix("cred:")
+        if not target.startswith(CREDENTIAL_TARGET_PREFIX + "/"):
+            return ""
+        try:
+            return _read_windows_credential(target)
+        except Exception as exc:
+            log(f"Windows Credential Manager read failed: {exc}")
+            return ""
+    if not value.startswith(("dpapi:", "plain:", "cred:")):
         # Legacy builds stored endpoint tokens as raw text. Return them so the
         # settings window can save once and migrate them to the current format.
         return value
@@ -488,16 +619,22 @@ def unprotect_secret(value: str) -> str:
 
 def blank_endpoint(index: int) -> dict:
     return {
-        "name": f"Endpoint {index + 1}",
+        "name": f"PBX {index + 1}",
         "endpoint": "",
         "enabled": index == 0,
-        "auth_mode": AUTH_TOKEN,
+        "auth_mode": AUTH_BASIC,
+        "delivery_mode": DELIVERY_LIVE,
+        "poll_seconds": DEFAULT_POLL_SECONDS,
+        "reconnect_automatically": True,
+        "allow_invalid_certificate": False,
+        "allow_legacy_media": False,
         "no_token": False,
         "token": "",
         "username": "",
         "password": "",
         "last_event_id": "",
         "last_fingerprint": "",
+        "recent_event_ids": [],
     }
 
 
@@ -512,17 +649,48 @@ def normalize_auth_mode(value: object, no_token: bool = False) -> str:
     return AUTH_TOKEN
 
 
+def normalize_delivery_mode(value: object, *, existing_url: str = "") -> str:
+    mode = normalize_key(value or "")
+    if mode in {"legacypolling", "polling", "poll", "json", "legacyfallback"}:
+        return DELIVERY_POLL
+    if mode in {"livesse", "live", "sse", "authenticatedhandshake", "liveauthenticatedhandshake"}:
+        return DELIVERY_LIVE
+    # Preserve upgraded 1.0.6 profiles as polling. Newly created profiles are live.
+    return DELIVERY_POLL if safe_string(existing_url) else DELIVERY_LIVE
+
+
+def normalize_poll_seconds(value: object, default: int = DEFAULT_POLL_SECONDS) -> int:
+    try:
+        return max(5, min(3600, int(value)))
+    except (TypeError, ValueError):
+        return max(5, min(3600, int(default)))
+
+
 def normalize_endpoint(value: object, index: int) -> dict:
     endpoint = blank_endpoint(index)
     if isinstance(value, dict):
         no_token = bool(value.get("no_token", value.get("noToken", False)))
         auth_mode = normalize_auth_mode(value.get("auth_mode", value.get("authMode", "")), no_token)
+        configured_url = safe_string(value.get("endpoint") or value.get("url"))
+        recent_ids = value.get("recent_event_ids", value.get("recentEventIds", []))
+        if not isinstance(recent_ids, list):
+            recent_ids = []
+        recent_ids = [safe_string(item) for item in recent_ids if safe_string(item)][-RECENT_EVENT_ID_LIMIT:]
         endpoint.update(
             {
                 "name": safe_string(value.get("name")) or endpoint["name"],
-                "endpoint": safe_string(value.get("endpoint") or value.get("url")),
+                "endpoint": configured_url,
                 "enabled": bool(value.get("enabled", endpoint["enabled"])),
                 "auth_mode": auth_mode,
+                "delivery_mode": normalize_delivery_mode(
+                    value.get("delivery_mode", value.get("deliveryMode", "")), existing_url=configured_url
+                ),
+                "poll_seconds": normalize_poll_seconds(
+                    value.get("poll_seconds", value.get("pollSeconds", DEFAULT_POLL_SECONDS))
+                ),
+                "reconnect_automatically": bool(value.get("reconnect_automatically", True)),
+                "allow_invalid_certificate": bool(value.get("allow_invalid_certificate", False)),
+                "allow_legacy_media": bool(value.get("allow_legacy_media", False)),
                 "no_token": auth_mode == AUTH_NONE,
                 "token": safe_string(value.get("token")),
                 "username": safe_string(value.get("username", value.get("user", ""))),
@@ -531,6 +699,7 @@ def normalize_endpoint(value: object, index: int) -> dict:
                 "last_fingerprint": safe_string(
                     value.get("last_fingerprint", value.get("lastFingerprint", ""))
                 ),
+                "recent_event_ids": recent_ids,
             }
         )
     return endpoint
@@ -538,16 +707,20 @@ def normalize_endpoint(value: object, index: int) -> dict:
 
 def normalize_endpoints(config: dict) -> list[dict]:
     endpoints: list[dict] = []
+    legacy_interval = normalize_poll_seconds(config.get("poll_seconds", DEFAULT_POLL_SECONDS))
     configured = config.get("endpoints")
     if isinstance(configured, list):
         for index, endpoint in enumerate(configured[:MAX_ENDPOINTS]):
-            endpoints.append(normalize_endpoint(endpoint, index))
+            normalized = normalize_endpoint(endpoint, index)
+            if isinstance(endpoint, dict) and "poll_seconds" not in endpoint and "pollSeconds" not in endpoint:
+                normalized["poll_seconds"] = legacy_interval
+            endpoints.append(normalized)
 
     if not endpoints and (config.get("endpoint") or config.get("token")):
         endpoints.append(
             normalize_endpoint(
                 {
-                    "name": "Endpoint 1",
+                    "name": "PBX 1",
                     "endpoint": config.get("endpoint", ""),
                     "enabled": True,
                     "auth_mode": AUTH_NONE if bool(config.get("no_token", False)) else AUTH_TOKEN,
@@ -555,6 +728,7 @@ def normalize_endpoints(config: dict) -> list[dict]:
                     "token": config.get("token", ""),
                     "username": config.get("username", ""),
                     "password": config.get("password", ""),
+                    "poll_seconds": legacy_interval,
                     "last_event_id": config.get("last_event_id", ""),
                     "last_fingerprint": config.get("last_fingerprint", ""),
                 },
@@ -597,7 +771,7 @@ def endpoint_has_credentials(endpoint: dict) -> bool:
 
 
 def endpoint_display_name(index: int, endpoint: dict) -> str:
-    name = safe_string(endpoint.get("name")) or f"Endpoint {index + 1}"
+    name = safe_string(endpoint.get("name")) or f"PBX {index + 1}"
     url = safe_string(endpoint.get("endpoint"))
     if url:
         parsed = urlparse(url)
@@ -631,6 +805,39 @@ def endpoint_security_warnings(url: str, auth_mode: str) -> list[tuple[str, str]
             )
         )
     return warnings
+
+
+def normalize_pbx_address(value: object) -> str:
+    address = safe_string(value)
+    if not address:
+        return ""
+    if "://" not in address:
+        address = "https://" + address
+    parsed = urlparse(address)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("PBX address must be an HTTP(S) hostname or URL without credentials, query, or fragment.")
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    port = f":{parsed.port}" if parsed.port and parsed.port != default_port else ""
+    return f"{parsed.scheme.lower()}://{host}{port}"
+
+
+def pbx_transport_url(endpoint_cfg: dict, delivery_mode: str | None = None) -> str:
+    origin = normalize_pbx_address(endpoint_cfg.get("endpoint", ""))
+    mode = delivery_mode or normalize_delivery_mode(
+        endpoint_cfg.get("delivery_mode"), existing_url=safe_string(endpoint_cfg.get("endpoint"))
+    )
+    path = PBX_LIVE_PATH if mode == DELIVERY_LIVE else PBX_POLL_PATH
+    return origin + path + ("?limit=25" if mode == DELIVERY_POLL else "")
 
 
 def audio_search_dirs() -> list[Path]:
@@ -706,6 +913,36 @@ def active_endpoints(config: dict) -> list[tuple[int, dict]]:
         if endpoint.get("enabled", True) and url and endpoint_url_allowed(url) and endpoint_has_credentials(endpoint):
             result.append((index, endpoint))
     return result
+
+
+def monitoring_idle_status(config: dict, *, connection_test_running: bool = False) -> str:
+    """Return an actionable reason when no transport worker can be started."""
+    if connection_test_running:
+        return "Connection test in progress; monitoring will resume automatically."
+    if not bool(config.get("enabled", True)):
+        return "Monitoring is disabled in Settings."
+
+    endpoints = normalize_endpoints(config)
+    enabled = [(index, endpoint) for index, endpoint in enumerate(endpoints) if endpoint.get("enabled", True)]
+    if not enabled:
+        return "Monitoring is waiting: enable at least one PBX profile."
+
+    for index, endpoint in enabled:
+        name = safe_string(endpoint.get("name")) or f"PBX {index + 1}"
+        url = safe_string(endpoint.get("endpoint"))
+        if not url:
+            return f"Monitoring is waiting: enter the PBX address for {name}."
+        if not endpoint_url_allowed(url):
+            return f"Monitoring is waiting: correct the PBX address for {name}."
+        auth_mode = normalize_auth_mode(endpoint.get("auth_mode"), bool(endpoint.get("no_token")))
+        if auth_mode == AUTH_BASIC:
+            if not safe_string(endpoint.get("username")):
+                return f"Monitoring is waiting: enter the desktop username for {name}."
+            if not unprotect_secret(endpoint.get("password", "")):
+                return f"Monitoring is waiting: enter the desktop password for {name}."
+        elif auth_mode == AUTH_TOKEN and not unprotect_secret(endpoint.get("token", "")):
+            return f"Monitoring is waiting: enter the API token for {name}."
+    return "Starting PBX monitoring..."
 
 
 def default_config() -> dict:
@@ -982,6 +1219,24 @@ class AlertData:
     recent_events: str
     event_id: str
     fingerprint: str
+    announcement_style: str = "standard"
+    background_color: str = ""
+    header_color: str = ""
+    accent_color: str = ""
+    text_color: str = ""
+    test_only: bool = False
+    allow_invalid_certificate: bool = False
+    allow_legacy_media: bool = False
+
+
+def safe_hex_color(value: object) -> str:
+    color = safe_string(value)
+    return color.lower() if re.fullmatch(r"#[0-9a-fA-F]{6}", color) else ""
+
+
+def bounded_text(value: object, limit: int) -> str:
+    text = safe_string(value)
+    return text[:limit]
 
 
 def format_recent_events(value: object) -> str:
@@ -1013,22 +1268,42 @@ def extract_alert(data: object, raw_text: str) -> AlertData:
         xml_payload = raw_text
 
     phone = parse_yealink_payload(xml_payload)
-    kind = safe_string(lookup(source, KIND_KEYS))
-    event = safe_string(lookup(source, EVENT_KEYS))
-    title = safe_string(lookup(source, TITLE_KEYS)) or phone.title
-    severity = safe_string(lookup(source, SEVERITY_KEYS))
-    priority = safe_string(lookup(source, PRIORITY_KEYS))
-    priority_label = safe_string(lookup(source, PRIORITY_LABEL_KEYS))
+    kind = bounded_text(lookup(source, KIND_KEYS), 40)
+    event = bounded_text(lookup(source, EVENT_KEYS), 160)
+    title = bounded_text(lookup_preferred(source, ("title",)), 160) or event or bounded_text(phone.title, 160)
+    severity = bounded_text(lookup(source, SEVERITY_KEYS), 80)
+    priority = bounded_text(lookup(source, PRIORITY_KEYS), 40)
+    priority_label = bounded_text(lookup(source, PRIORITY_LABEL_KEYS), 80)
     image_url = safe_string(lookup(source, IMAGE_KEYS))
-    recipients = safe_string(lookup(source, RECIPIENT_KEYS))
-    timestamp = safe_string(lookup(source, TIMESTAMP_KEYS))
-    area = safe_string(lookup(source, AREA_KEYS))
-    effective = safe_string(lookup(source, EFFECTIVE_KEYS))
-    expires = safe_string(lookup(source, EXPIRES_KEYS))
-    body = safe_string(lookup_preferred(source, ("body", "description", "text", "message", "desc")))
-    description = safe_string(lookup_preferred(source, ("description", "body", "text", "message", "desc")))
+    recipients = bounded_text(lookup(source, RECIPIENT_KEYS), 1000)
+    timestamp = bounded_text(lookup(source, TIMESTAMP_KEYS), 100)
+    area = bounded_text(lookup(source, AREA_KEYS), 500)
+    effective = bounded_text(lookup(source, EFFECTIVE_KEYS), 100)
+    expires = bounded_text(lookup(source, EXPIRES_KEYS), 100)
+    # The PBX contract intentionally prefers message over compatibility aliases.
+    body = bounded_text(lookup_preferred(source, ("message", "body", "text", "description", "desc")), 8000)
+    description = bounded_text(lookup_preferred(source, ("description", "message", "body", "text", "desc")), 8000)
     event_id = safe_string(lookup(source, EVENT_ID_KEYS))
     recent_events = format_recent_events(lookup(data, RECENT_EVENT_KEYS))
+
+    presentation = source.get("presentation") if isinstance(source, dict) else None
+    if not isinstance(presentation, dict):
+        presentation = {}
+    announcement_style = bounded_text(
+        presentation.get("style") or (source.get("announcement_style") if isinstance(source, dict) else ""), 40
+    ) or "standard"
+    background_color = safe_hex_color(
+        presentation.get("background_color") or (source.get("background_color") if isinstance(source, dict) else "")
+    )
+    header_color = safe_hex_color(
+        presentation.get("header_color") or (source.get("header_color") if isinstance(source, dict) else "")
+    )
+    accent_color = safe_hex_color(
+        presentation.get("accent_color") or (source.get("accent_color") if isinstance(source, dict) else "")
+    )
+    text_color = safe_hex_color(
+        presentation.get("text_color") or (source.get("text_color") if isinstance(source, dict) else "")
+    )
 
     if not kind:
         normalized_title_event = normalize_key(f"{title} {event}")
@@ -1040,7 +1315,11 @@ def extract_alert(data: object, raw_text: str) -> AlertData:
     if not title and phone.text:
         title = phone.text.splitlines()[0][:80]
     if not title:
-        title = "SIP NOTIFY Alert"
+        title = "SLS Mass Notification"
+
+    test_marker = f"{title}\n{body}\n{event}".upper()
+    lightning_marker = normalize_key(f"{title} {event}")
+    test_only = "TEST ONLY" in test_marker or ("lightning" in lightning_marker and "test" in lightning_marker)
 
     fingerprint_source = "|".join(
         [
@@ -1086,6 +1365,12 @@ def extract_alert(data: object, raw_text: str) -> AlertData:
         recent_events=recent_events,
         event_id=event_id,
         fingerprint=fingerprint,
+        announcement_style=announcement_style,
+        background_color=background_color,
+        header_color=header_color,
+        accent_color=accent_color,
+        text_color=text_color,
+        test_only=test_only,
     )
 
 
@@ -1094,6 +1379,22 @@ class ApiError(Exception):
 
 
 class UnauthorizedError(ApiError):
+    pass
+
+
+class TlsRequiredError(ApiError):
+    pass
+
+
+class RateLimitedError(ApiError):
+    pass
+
+
+class ServiceUnavailableError(ApiError):
+    pass
+
+
+class StreamProtocolError(ApiError):
     pass
 
 
@@ -1136,9 +1437,37 @@ class SameOriginRedirectHandler(HttpSchemeRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def open_http_request(request: urllib.request.Request, timeout: int):
-    opener = urllib.request.build_opener(HttpSchemeRedirectHandler())
+def build_http_opener(*, same_origin: bool = False, allow_invalid_certificate: bool = False):
+    handlers: list[object] = [SameOriginRedirectHandler() if same_origin else HttpSchemeRedirectHandler()]
+    if allow_invalid_certificate:
+        context = ssl._create_unverified_context()  # Explicit, per-profile unsafe testing option.  # nosec B323
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    return urllib.request.build_opener(*handlers)
+
+
+def open_http_request(
+    request: urllib.request.Request,
+    timeout: int,
+    *,
+    same_origin: bool = False,
+    allow_invalid_certificate: bool = False,
+):
+    opener = build_http_opener(
+        same_origin=same_origin, allow_invalid_certificate=allow_invalid_certificate
+    )
     return opener.open(request, timeout=timeout)
+
+
+def raise_http_status(exc: urllib.error.HTTPError) -> None:
+    if exc.code == 401:
+        raise UnauthorizedError("Authentication failed. Review the desktop username and password.") from exc
+    if exc.code == 426:
+        raise TlsRequiredError("HTTPS is required by the PBX.") from exc
+    if exc.code == 429:
+        raise RateLimitedError("Authentication attempts were rate limited; waiting at least one minute.") from exc
+    if exc.code == 503:
+        raise ServiceUnavailableError("The PBX desktop notification service is unavailable.") from exc
+    raise ApiError(f"HTTP {exc.code}: {exc.reason}") from exc
 
 
 def endpoint_auth_headers(endpoint_cfg: dict) -> dict[str, str]:
@@ -1158,22 +1487,27 @@ def endpoint_auth_headers(endpoint_cfg: dict) -> dict[str, str]:
     return {}
 
 
-def fetch_endpoint(endpoint: str, auth_headers: dict[str, str] | None = None) -> tuple[object, str]:
+def fetch_endpoint(
+    endpoint: str,
+    auth_headers: dict[str, str] | None = None,
+    *,
+    allow_invalid_certificate: bool = False,
+) -> tuple[object, str]:
     headers = {
         "Accept": "application/json, application/xml, text/xml, text/plain, */*",
         "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
     }
     headers.update(auth_headers or {})
     request = urllib.request.Request(endpoint, headers=headers, method="GET")
-    opener = urllib.request.build_opener(SameOriginRedirectHandler())
+    opener = build_http_opener(
+        same_origin=True, allow_invalid_certificate=allow_invalid_certificate
+    )
     try:
         with opener.open(request, timeout=10) as response:
             content_type = response.headers.get("Content-Type", "")
             raw_bytes = response.read(1024 * 1024)
     except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            raise UnauthorizedError("Unauthorized request. Check endpoint credentials.") from exc
-        raise ApiError(f"HTTP {exc.code}: {exc.reason}") from exc
+        raise_http_status(exc)
     except urllib.error.URLError as exc:
         raise ApiError(str(exc.reason)) from exc
     except TimeoutError as exc:
@@ -1188,6 +1522,122 @@ def fetch_endpoint(endpoint: str, auth_headers: dict[str, str] | None = None) ->
     if raw_text.lstrip().startswith("<"):
         return {"xml_payload": raw_text}, raw_text
     return {"raw": raw_text}, raw_text
+
+
+@dataclass
+class SseEvent:
+    name: str
+    data: str
+    event_id: str
+    retry_ms: int | None = None
+
+
+def iter_sse_events(response, *, on_activity=None, stop_event: threading.Event | None = None):
+    event_name = ""
+    event_id = ""
+    data_lines: list[str] = []
+    retry_ms: int | None = None
+    event_bytes = 0
+
+    def dispatch():
+        nonlocal event_name, data_lines, retry_ms, event_bytes
+        if not data_lines:
+            event_name = ""
+            event_bytes = 0
+            return None
+        event = SseEvent(event_name or "message", "\n".join(data_lines), event_id, retry_ms)
+        event_name = ""
+        data_lines = []
+        retry_ms = None
+        event_bytes = 0
+        return event
+
+    while stop_event is None or not stop_event.is_set():
+        raw_line = response.readline(SSE_MAX_LINE_BYTES + 1)
+        if not raw_line:
+            pending = dispatch()
+            if pending is not None:
+                yield pending
+            return
+        if len(raw_line) > SSE_MAX_LINE_BYTES:
+            raise StreamProtocolError("SSE line exceeded the client safety limit.")
+        if on_activity is not None:
+            on_activity()
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            pending = dispatch()
+            if pending is not None:
+                yield pending
+            continue
+        if line.startswith(":"):
+            continue
+        field, separator, value = line.partition(":")
+        if separator and value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event_name = value
+        elif field == "data":
+            event_bytes += len(raw_line)
+            if event_bytes > SSE_MAX_EVENT_BYTES:
+                raise StreamProtocolError("SSE event exceeded the client safety limit.")
+            data_lines.append(value)
+        elif field == "id" and "\x00" not in value:
+            event_id = value
+        elif field == "retry" and value.isdigit():
+            retry_ms = min(int(value), 60_000)
+
+
+def set_stream_read_timeout(response, timeout: int) -> None:
+    """Apply a read timeout after HTTP headers arrive without lengthening authentication."""
+    candidates = (
+        getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None),
+        getattr(getattr(response, "fp", None), "_sock", None),
+    )
+    for sock in candidates:
+        if sock is not None and hasattr(sock, "settimeout"):
+            sock.settimeout(timeout)
+            return
+
+
+def open_sse_response(
+    endpoint_cfg: dict,
+    *,
+    timeout: int = SSE_CONNECT_TIMEOUT_SECONDS,
+    read_timeout: int = SSE_READ_TIMEOUT_SECONDS,
+):
+    if normalize_auth_mode(endpoint_cfg.get("auth_mode"), bool(endpoint_cfg.get("no_token"))) != AUTH_BASIC:
+        raise ApiError("Live authenticated handshake requires desktop username/password authentication.")
+    url = pbx_transport_url(endpoint_cfg, DELIVERY_LIVE)
+    if urlparse(url).scheme.lower() != "https":
+        raise TlsRequiredError("Live authenticated handshake requires HTTPS.")
+    headers = {
+        "Accept": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
+        **endpoint_auth_headers(endpoint_cfg),
+    }
+    last_event_id = safe_string(endpoint_cfg.get("last_event_id"))
+    if last_event_id:
+        headers["Last-Event-ID"] = last_event_id
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    opener = build_http_opener(
+        same_origin=True,
+        allow_invalid_certificate=bool(endpoint_cfg.get("allow_invalid_certificate", False)),
+    )
+    try:
+        response = opener.open(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        raise_http_status(exc)
+    except urllib.error.URLError as exc:
+        raise ApiError(str(exc.reason)) from exc
+    except TimeoutError as exc:
+        raise ApiError("Live handshake timed out.") from exc
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "text/event-stream" not in content_type:
+        response.close()
+        raise StreamProtocolError("PBX did not return an event-stream response.")
+    set_stream_read_timeout(response, read_timeout)
+    return response
 
 
 def ensure_api_ok(data: object) -> None:
@@ -1222,12 +1672,28 @@ def resolve_image_url(image_url: str, endpoint: str) -> str:
     return urljoin(endpoint, image_url)
 
 
-def normalize_alert_urls(alert: AlertData, endpoint: str) -> None:
+def normalize_alert_urls(alert: AlertData, endpoint: str, endpoint_cfg: dict | None = None) -> None:
     alert.image_url = resolve_image_url(alert.image_url, endpoint)
     alert.source_endpoint = endpoint
+    endpoint_cfg = endpoint_cfg or {}
+    alert.allow_invalid_certificate = bool(endpoint_cfg.get("allow_invalid_certificate", False))
+    alert.allow_legacy_media = bool(endpoint_cfg.get("allow_legacy_media", False))
+    if alert.image_url:
+        image_origin = request_origin(alert.image_url)
+        source_origin = request_origin(endpoint)
+        if image_origin != source_origin:
+            alert.image_url = ""
+        elif image_origin[0] != "https" and not alert.allow_legacy_media:
+            alert.image_url = ""
 
 
-def fetch_image_bytes(image_url: str) -> bytes:
+def fetch_image_bytes(
+    image_url: str,
+    *,
+    source_endpoint: str = "",
+    allow_invalid_certificate: bool = False,
+    allow_legacy_media: bool = False,
+) -> bytes:
     parsed = urlparse(image_url)
     if (
         parsed.scheme.lower() not in {"http", "https"}
@@ -1236,6 +1702,10 @@ def fetch_image_bytes(image_url: str) -> bytes:
         or parsed.password is not None
     ):
         raise ApiError("Alert image URL must be an HTTP(S) URL without embedded credentials")
+    if parsed.scheme.lower() != "https" and not allow_legacy_media:
+        raise ApiError("Insecure alert media was blocked")
+    if source_endpoint and request_origin(image_url) != request_origin(source_endpoint):
+        raise ApiError("Cross-origin alert media was blocked")
     request = urllib.request.Request(
         image_url,
         headers={
@@ -1244,7 +1714,12 @@ def fetch_image_bytes(image_url: str) -> bytes:
         },
         method="GET",
     )
-    with open_http_request(request, timeout=8) as response:
+    with open_http_request(
+        request,
+        timeout=8,
+        same_origin=True,
+        allow_invalid_certificate=allow_invalid_certificate,
+    ) as response:
         data = response.read(IMAGE_FETCH_LIMIT_BYTES + 1)
     if len(data) > IMAGE_FETCH_LIMIT_BYTES:
         raise ApiError("Image response was too large")
@@ -1594,6 +2069,21 @@ class AlertWindow:
         return "announcement" in marker
 
     def _alert_palette(self) -> dict[str, str]:
+        if self.alert.background_color:
+            background = self.alert.background_color
+            header = self.alert.header_color or background
+            accent = self.alert.accent_color or header
+            text_color = self.alert.text_color or "#ffffff"
+            return {
+                "outer": header,
+                "header": header,
+                "body": background,
+                "stripe_a": background,
+                "stripe_b": background,
+                "outline": accent,
+                "text": text_color,
+                "muted": text_color,
+            }
         priority_text = " ".join(
             part for part in (self.alert.priority_label, self.alert.priority, self.alert.severity) if part
         ).lower()
@@ -1667,7 +2157,7 @@ class AlertWindow:
             text=wrap_for_canvas(title, 25, 2),
             fill=palette["text"],
             justify="center",
-            font=("Segoe UI", 34),
+            font=("Segoe UI", -34),
         )
         canvas.create_text(
             sx + sw / 2,
@@ -1675,7 +2165,7 @@ class AlertWindow:
             text=wrap_for_canvas(priority, 30, 2),
             fill=palette["text"],
             justify="center",
-            font=("Segoe UI", 30, "bold"),
+            font=("Segoe UI", -30, "bold"),
         )
         canvas.create_text(
             sx + sw / 2,
@@ -1684,7 +2174,7 @@ class AlertWindow:
             fill=palette["text"],
             justify="center",
             width=690,
-            font=("Segoe UI", 24, "bold"),
+            font=("Segoe UI", -24, "bold"),
         )
         if timing:
             canvas.create_text(
@@ -1694,7 +2184,7 @@ class AlertWindow:
                 fill=palette["muted"],
                 justify="center",
                 width=700,
-                font=("Segoe UI", 17, "bold"),
+                font=("Segoe UI", -17, "bold"),
             )
 
     def _announcement_text_parts(self) -> tuple[str, str, str]:
@@ -1706,44 +2196,44 @@ class AlertWindow:
     def _draw_announcement_screen(self, canvas) -> None:
         sx, sy, sw, sh = self.SCREEN_X, self.SCREEN_Y, self.SCREEN_W, self.SCREEN_H
         title, body, _created = self._announcement_text_parts()
-        canvas.create_rectangle(sx, sy, sx + sw, sy + sh, fill="#f6f8fb", outline="#c6d1df")
-        canvas.create_rectangle(sx + 2, sy + 2, sx + sw - 2, sy + sh - 2, fill="#ffffff", outline="#d7e0eb")
+        background = self.alert.background_color or "#ffffff"
+        header = self.alert.header_color or background
+        accent = self.alert.accent_color or "#f5b82e"
+        text_color = self.alert.text_color or "#172033"
+        outline = self.alert.accent_color or "#d7e0eb"
+        canvas.create_rectangle(sx, sy, sx + sw, sy + sh, fill=header, outline=outline)
+        canvas.create_rectangle(sx + 2, sy + 2, sx + sw - 2, sy + sh - 2, fill=background, outline=outline)
 
-        triangle = [
-            sx + sw / 2,
-            sy + 56,
-            sx + sw / 2 - 44,
-            sy + 132,
-            sx + sw / 2 + 44,
-            sy + 132,
-        ]
-        canvas.create_polygon(triangle, fill="#f5b82e", outline="#98690a", width=3)
+        content_top = sy + 70 if self.alert.test_only else sy + 42
+        if self.alert.test_only:
+            canvas.create_rectangle(sx + 2, sy + 2, sx + sw - 2, sy + 40, fill="#7f1d1d", outline="")
+            canvas.create_text(
+                sx + sw / 2,
+                sy + 21,
+                text="TEST ONLY — NOT A LIVE EMERGENCY",
+                fill="#ffffff",
+                font=("Segoe UI", -15, "bold"),
+            )
+        canvas.create_rectangle(sx + 30, content_top, sx + 38, sy + sh - 42, fill=accent, outline="")
         canvas.create_text(
-            sx + sw / 2,
-            sy + 104,
-            text="!",
-            fill="#332300",
-            justify="center",
-            font=("Segoe UI", 42, "bold"),
-        )
-
-        canvas.create_text(
-            sx + sw / 2,
-            sy + 182,
+            sx + 62,
+            content_top,
             text=wrap_for_canvas(title or "Announcement", 30, 2),
-            fill="#172033",
-            justify="center",
-            width=700,
-            font=("Segoe UI", 32, "bold"),
+            fill=text_color,
+            justify="left",
+            anchor="nw",
+            width=690,
+            font=("Segoe UI Semibold", -29),
         )
         canvas.create_text(
-            sx + sw / 2,
-            sy + 292,
-            text=wrap_for_canvas(body, 58, 5),
-            fill="#263447",
-            justify="center",
-            width=660,
-            font=("Segoe UI", 22),
+            sx + 62,
+            content_top + 105,
+            text=wrap_for_canvas(body, 68, 7),
+            fill=text_color,
+            justify="left",
+            anchor="nw",
+            width=690,
+            font=("Segoe UI", -19),
         )
 
     def _load_screen_image(self) -> bool:
@@ -1755,7 +2245,12 @@ class AlertWindow:
 
         def worker() -> None:
             try:
-                image_bytes = fetch_image_bytes(image_url)
+                image_bytes = fetch_image_bytes(
+                    image_url,
+                    source_endpoint=self.alert.source_endpoint,
+                    allow_invalid_certificate=self.alert.allow_invalid_certificate,
+                    allow_legacy_media=self.alert.allow_legacy_media,
+                )
             except Exception as exc:
                 log(f"alert image fetch failed: {exc}")
                 image_bytes = None
@@ -1910,7 +2405,21 @@ class RawTextWindow:
 
         frame = ttk.Frame(self.window, padding=10)
         frame.pack(fill="both", expand=True)
-        text = Text(frame, wrap="word", font=("Consolas", 10))
+        self.window.configure(bg="#111418")
+        text = Text(
+            frame,
+            wrap="word",
+            font=("Consolas", 10),
+            bg="#0f1317",
+            fg="#e6edf3",
+            insertbackground="#e6edf3",
+            selectbackground="#264f78",
+            relief="flat",
+            padx=10,
+            pady=10,
+            highlightthickness=1,
+            highlightbackground="#343b44",
+        )
         scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=scroll.set)
         text.insert("1.0", content)
@@ -2005,7 +2514,7 @@ class SettingsWindow:
     def __init__(self, app: "MassNotifyApp") -> None:
         self.app = app
         self.window = Toplevel(app.root)
-        self.window.title("SLS Mass Notify App")
+        self.window.title("SLS Mass Notify — Settings")
         self._set_initial_geometry()
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         icon = resource_path("favicon.ico")
@@ -2020,7 +2529,6 @@ class SettingsWindow:
         self.enabled_var = BooleanVar(value=bool(cfg.get("enabled", True)))
         self.startup_var = BooleanVar(value=is_startup_enabled() or bool(cfg.get("startup_enabled", True)))
         self.auto_update_var = BooleanVar(value=bool(cfg.get("auto_update_enabled", True)))
-        self.interval_var = IntVar(value=int(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS)))
         self.audio_var = StringVar(value=safe_audio_name(safe_string(cfg.get("audio_sound")) or DEFAULT_AUDIO_NAME))
         self.audio_combo: ttk.Combobox | None = None
         self.endpoint_forms: list[dict] = []
@@ -2029,6 +2537,7 @@ class SettingsWindow:
         self.selected_endpoint_index = 0
         self.logo_image = None
         self.monitor_badge: ttk.Label | None = None
+        self.test_button: ttk.Button | None = None
 
         self._build(cfg)
         self.window.update_idletasks()
@@ -2049,84 +2558,87 @@ class SettingsWindow:
         if "clam" in style.theme_names():
             style.theme_use("clam")
 
-        page = "#f3f6f7"
-        surface = "#ffffff"
-        inset = "#f7faf9"
-        ink = "#152522"
-        muted = "#60716d"
-        accent = "#087f70"
-        accent_hover = "#06695e"
-        border = "#d9e3e0"
+        page = "#111418"
+        surface = "#181c21"
+        inset = "#20252b"
+        field = "#0f1317"
+        ink = "#f3f4f6"
+        muted = "#a7afb9"
+        accent = "#2f81f7"
+        accent_hover = "#388bfd"
+        border = "#343b44"
 
         self.window.configure(bg=page)
         style.configure(".", background=page, foreground=ink, font=("Segoe UI", 10))
         style.configure("Surface.TFrame", background=page)
         style.configure("Card.TFrame", background=surface, borderwidth=1, relief="solid")
+        style.configure("Panel.TFrame", background=surface, borderwidth=0, relief="flat")
         style.configure("Inset.TFrame", background=inset)
-        style.configure("Header.TFrame", background="#173b36")
-        style.configure("Header.TLabel", background="#173b36", foreground="#ffffff", font=("Segoe UI Semibold", 22))
-        style.configure("HeaderHint.TLabel", background="#173b36", foreground="#cde4df", font=("Segoe UI", 10))
-        style.configure("Version.TLabel", background="#173b36", foreground="#91d8ca", font=("Segoe UI Semibold", 9))
-        style.configure("BadgeOn.TLabel", background="#d6f4eb", foreground="#076652", font=("Segoe UI Semibold", 9), padding=(10, 5))
-        style.configure("BadgeOff.TLabel", background="#e7eceb", foreground="#52615e", font=("Segoe UI Semibold", 9), padding=(10, 5))
-        style.configure("Section.TLabel", background=surface, foreground=ink, font=("Segoe UI Semibold", 13))
+        style.configure("Header.TFrame", background=surface)
+        style.configure("Header.TLabel", background=surface, foreground=ink, font=("Segoe UI Semibold", 16))
+        style.configure("HeaderHint.TLabel", background=surface, foreground=muted, font=("Segoe UI", 9))
+        style.configure("Version.TLabel", background=surface, foreground=muted, font=("Segoe UI", 9))
+        style.configure("BadgeOn.TLabel", background=surface, foreground="#4ade80", font=("Segoe UI Semibold", 9))
+        style.configure("BadgeOff.TLabel", background=surface, foreground=muted, font=("Segoe UI", 9))
+        style.configure("Section.TLabel", background=surface, foreground=ink, font=("Segoe UI Semibold", 11))
         style.configure("Field.TLabel", background=inset, foreground=ink, font=("Segoe UI", 9))
         style.configure("Hint.TLabel", background=surface, foreground=muted, font=("Segoe UI", 9))
         style.configure("InsetHint.TLabel", background=inset, foreground=muted, font=("Segoe UI", 9))
         style.configure("StatusBar.TFrame", background=surface)
         style.configure("Status.TLabel", background=surface, foreground=muted, font=("Segoe UI", 9))
-        style.configure("RedWarning.TLabel", background=inset, foreground="#b42318", font=("Segoe UI Semibold", 9))
-        style.configure("YellowWarning.TLabel", background=inset, foreground="#9a6700", font=("Segoe UI Semibold", 9))
+        style.configure("RedWarning.TLabel", background=inset, foreground="#ff7b72", font=("Segoe UI Semibold", 9))
+        style.configure("YellowWarning.TLabel", background=inset, foreground="#e3b341", font=("Segoe UI Semibold", 9))
         style.configure("Card.TCheckbutton", background=surface, foreground=ink, padding=(0, 3))
         style.map("Card.TCheckbutton", background=[("active", surface)])
         style.configure("Inset.TCheckbutton", background=inset, foreground=ink, padding=(0, 3))
         style.map("Inset.TCheckbutton", background=[("active", inset)])
-        style.configure("TEntry", fieldbackground=surface, bordercolor=border, lightcolor=border, darkcolor=border, padding=(8, 6))
-        style.configure("TCombobox", fieldbackground=surface, bordercolor=border, lightcolor=border, darkcolor=border, padding=(6, 5))
-        style.configure("TSpinbox", fieldbackground=surface, bordercolor=border, lightcolor=border, darkcolor=border, padding=(6, 5))
-        style.configure("TButton", background="#edf2f1", foreground=ink, borderwidth=0, padding=(13, 8), font=("Segoe UI Semibold", 9))
-        style.map("TButton", background=[("active", "#e0e9e7"), ("pressed", "#d5e1df")])
-        style.configure("Accent.TButton", background=accent, foreground="#ffffff", padding=(16, 9), font=("Segoe UI Semibold", 9))
-        style.map("Accent.TButton", background=[("active", accent_hover), ("pressed", "#05564d")], foreground=[("disabled", "#d8e3e1")])
-        style.configure("Endpoint.TButton", background="#edf2f1", foreground="#4a5c58", padding=(14, 8))
-        style.configure("EndpointSelected.TButton", background="#d8f1eb", foreground="#08695b", padding=(14, 8))
-        style.map("EndpointSelected.TButton", background=[("active", "#cae9e2")])
-        style.configure("Horizontal.TProgressbar", background=accent, troughcolor="#dfe8e6", borderwidth=0)
+        style.configure("TEntry", fieldbackground=field, foreground=ink, bordercolor=border, lightcolor=border, darkcolor=border, padding=(8, 6))
+        style.configure("TCombobox", fieldbackground=field, foreground=ink, arrowcolor=muted, bordercolor=border, lightcolor=border, darkcolor=border, padding=(6, 5))
+        style.map("TCombobox", fieldbackground=[("readonly", field)], foreground=[("readonly", ink)], selectbackground=[("readonly", field)], selectforeground=[("readonly", ink)])
+        style.configure("TSpinbox", fieldbackground=field, foreground=ink, arrowcolor=muted, bordercolor=border, lightcolor=border, darkcolor=border, padding=(6, 5))
+        style.configure("TButton", background="#2a3038", foreground=ink, padding=(12, 7), font=("Segoe UI", 9), bordercolor=border)
+        style.map("TButton", background=[("active", "#343c46"), ("pressed", "#3d4652")], foreground=[("disabled", "#727b86")])
+        style.configure("Accent.TButton", background=accent, foreground="#ffffff", padding=(14, 7), font=("Segoe UI Semibold", 9))
+        style.map("Accent.TButton", background=[("active", accent_hover), ("pressed", "#1f6feb")], foreground=[("disabled", "#89929d")])
+        style.configure("Endpoint.TButton", background="#2a3038", foreground=ink, padding=(14, 7))
+        style.configure("EndpointSelected.TButton", background="#17345a", foreground="#8ec5ff", padding=(14, 7))
+        style.map("EndpointSelected.TButton", background=[("active", "#1d4474")])
+        style.configure("Horizontal.TProgressbar", background=accent, troughcolor="#252b32", borderwidth=0)
 
     def _build(self, cfg: dict) -> None:
         self.window.rowconfigure(1, weight=1)
         self.window.columnconfigure(0, weight=1)
 
-        header = ttk.Frame(self.window, padding=(26, 20), style="Header.TFrame")
+        header = ttk.Frame(self.window, padding=(22, 13), style="Header.TFrame")
         header.grid(row=0, column=0, sticky="ew")
         title_block = ttk.Frame(header, style="Header.TFrame")
         title_block.pack(side="left", fill="x", expand=True)
-        ttk.Label(title_block, text="SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(title_block, text="SLS Mass Notify settings", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             title_block,
-            text="Reliable desktop delivery for Southland Servers alerts and announcements",
+            text="Configure PBX connections, notifications, and Windows startup behavior.",
             style="HeaderHint.TLabel",
         ).pack(anchor="w", pady=(3, 0))
         header_meta = ttk.Frame(header, style="Header.TFrame")
         header_meta.pack(side="right", anchor="ne")
-        ttk.Label(header_meta, text=f"VERSION {APP_VERSION}", style="Version.TLabel").pack(anchor="e", pady=(0, 7))
+        ttk.Label(header_meta, text=f"Version {APP_VERSION}", style="Version.TLabel").pack(anchor="e", pady=(0, 7))
         enabled = bool(self.enabled_var.get())
         self.monitor_badge = ttk.Label(
             header_meta,
-            text="MONITORING ON" if enabled else "MONITORING OFF",
+            text="Monitoring enabled" if enabled else "Monitoring disabled",
             style="BadgeOn.TLabel" if enabled else "BadgeOff.TLabel",
         )
         self.monitor_badge.pack(anchor="e")
 
         content = ttk.Frame(self.window, style="Surface.TFrame")
-        content.grid(row=1, column=0, sticky="nsew", padx=22, pady=(18, 12))
+        content.grid(row=1, column=0, sticky="nsew", padx=16, pady=(14, 10))
 
         def make_scroll_area(parent: ttk.Frame) -> ttk.Frame:
             parent.rowconfigure(0, weight=1)
             parent.columnconfigure(0, weight=1)
             scroll_frame = ttk.Frame(parent, style="Surface.TFrame")
             scroll_frame.grid(row=0, column=0, sticky="nsew")
-            canvas = Canvas(scroll_frame, bg="#f7f9fc", highlightthickness=0, bd=0)
+            canvas = Canvas(scroll_frame, bg="#111418", highlightthickness=0, bd=0)
             scrollbar = ttk.Scrollbar(scroll_frame, orient="vertical", command=canvas.yview)
             inner = ttk.Frame(canvas, padding=(4, 4, 14, 14), style="Surface.TFrame")
             canvas.configure(yscrollcommand=scrollbar.set)
@@ -2173,12 +2685,12 @@ class SettingsWindow:
         overview.columnconfigure(0, weight=1, uniform="overview")
         overview.columnconfigure(1, weight=1, uniform="overview")
 
-        general = ttk.Frame(overview, padding=20, style="Card.TFrame")
+        general = ttk.Frame(overview, padding=16, style="Card.TFrame")
         general.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         ttk.Label(general, text="App behavior", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(
             general,
-            text="Control monitoring, startup, updates, and how often endpoints are checked.",
+            text="Monitoring, Windows startup, and automatic updates.",
             style="Hint.TLabel",
             wraplength=430,
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 13))
@@ -2190,54 +2702,50 @@ class SettingsWindow:
         )
         ttk.Checkbutton(
             general,
-            text="Automatically install verified release updates",
+            text="Install verified updates automatically",
             variable=self.auto_update_var,
             style="Card.TCheckbutton",
         ).grid(row=4, column=0, columnspan=4, sticky="w")
-        ttk.Label(general, text="Polling interval", style="Hint.TLabel").grid(row=5, column=0, sticky="w", pady=(13, 3))
-        ttk.Spinbox(general, from_=5, to=3600, textvariable=self.interval_var, width=7).grid(
-            row=6, column=0, sticky="w"
-        )
-        ttk.Label(general, text="seconds", style="Hint.TLabel").grid(row=6, column=1, sticky="w", padx=(8, 0))
         general.columnconfigure(3, weight=1)
 
-        audio = ttk.Frame(overview, padding=20, style="Card.TFrame")
+        audio = ttk.Frame(overview, padding=16, style="Card.TFrame")
         audio.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        ttk.Label(audio, text="Alert Audio", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(audio, text="Notification sound", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(
             audio,
-            text="Select the WAV sound that plays once when a new notification arrives.",
+            text="Choose the sound played for new notifications.",
             style="Hint.TLabel",
             wraplength=430,
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 15))
         ttk.Label(audio, text="Notification sound", style="Hint.TLabel").grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, 4))
         self.audio_combo = ttk.Combobox(audio, textvariable=self.audio_var, values=list_audio_choices(), state="readonly", width=32)
         self.audio_combo.grid(row=3, column=0, columnspan=4, sticky="ew")
-        audio_actions = ttk.Frame(audio, style="Card.TFrame")
+        audio_actions = ttk.Frame(audio, style="Panel.TFrame")
         audio_actions.grid(row=4, column=0, columnspan=4, sticky="w", pady=(11, 0))
         ttk.Button(audio_actions, text="Play sound", command=self.play_selected_audio).pack(side="left", padx=(0, 8))
         ttk.Button(audio_actions, text="Import WAV", command=self.import_audio).pack(side="left")
         ttk.Label(
             audio,
-            text="Imported files stay in your protected app settings folder.",
+            text="Custom WAV files are stored with your app settings.",
             style="Hint.TLabel",
         ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(12, 0))
         audio.columnconfigure(0, weight=1)
         self.refresh_audio_choices()
 
-        endpoints_frame = ttk.Frame(mass_frame, padding=20, style="Card.TFrame")
+        endpoints_frame = ttk.Frame(mass_frame, padding=16, style="Card.TFrame")
         endpoints_frame.pack(fill="both", expand=True, pady=(0, 12))
-        endpoint_heading = ttk.Frame(endpoints_frame, style="Card.TFrame")
+        endpoint_heading = ttk.Frame(endpoints_frame, style="Panel.TFrame")
         endpoint_heading.pack(fill="x")
-        ttk.Label(endpoint_heading, text="Notification endpoints", style="Section.TLabel").pack(side="left", anchor="w")
-        ttk.Label(endpoint_heading, text="Up to 3 sources", style="Hint.TLabel").pack(side="right", anchor="e")
+        ttk.Label(endpoint_heading, text="PBX connections", style="Section.TLabel").pack(side="left", anchor="w")
+        ttk.Label(endpoint_heading, text="Three profiles available", style="Hint.TLabel").pack(side="right", anchor="e")
         ttk.Label(
             endpoints_frame,
-            text="Configure each alert source independently. Credentials are protected with Windows DPAPI.",
+            text="Live profiles use an authenticated stream. Secrets are stored in Windows Credential Manager.",
             style="Hint.TLabel",
+            wraplength=680,
         ).pack(anchor="w", pady=(3, 14))
 
-        selector = ttk.Frame(endpoints_frame, style="Card.TFrame")
+        selector = ttk.Frame(endpoints_frame, style="Panel.TFrame")
         selector.pack(fill="x", pady=(0, 12))
         panel_host = ttk.Frame(endpoints_frame, style="Inset.TFrame", padding=18)
         panel_host.pack(fill="both", expand=True)
@@ -2245,7 +2753,7 @@ class SettingsWindow:
         for index, endpoint in enumerate(normalize_endpoints(cfg)):
             button = ttk.Button(
                 selector,
-                text=f"Endpoint {index + 1}",
+                text=f"PBX {index + 1}",
                 style="EndpointSelected.TButton" if index == 0 else "Endpoint.TButton",
                 command=lambda idx=index: self.show_endpoint(idx),
             )
@@ -2258,7 +2766,7 @@ class SettingsWindow:
             if index != 0:
                 group.grid_remove()
 
-        footer = ttk.Frame(self.window, padding=(22, 12), style="StatusBar.TFrame")
+        footer = ttk.Frame(self.window, padding=(16, 10), style="StatusBar.TFrame")
         footer.grid(row=2, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
         self.status_label = ttk.Label(
@@ -2271,22 +2779,31 @@ class SettingsWindow:
 
         actions = ttk.Frame(footer, style="StatusBar.TFrame")
         actions.grid(row=0, column=1, sticky="e")
-        ttk.Button(actions, text="Test endpoints", command=self.test_now).pack(side="left", padx=(0, 8))
+        self.test_button = ttk.Button(actions, text="Test connections", command=self.test_now)
+        self.test_button.pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="Save changes", style="Accent.TButton", command=self.save).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="Close", command=self.close).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Quit App", command=self.quit_app).pack(side="left")
+        ttk.Button(actions, text="Exit", command=self.quit_app).pack(side="left")
 
 
     def _build_endpoint_tab(self, parent: ttk.Frame, index: int, endpoint: dict) -> None:
         auth_mode = normalize_auth_mode(endpoint.get("auth_mode"), bool(endpoint.get("no_token")))
+        delivery_mode = normalize_delivery_mode(
+            endpoint.get("delivery_mode"), existing_url=safe_string(endpoint.get("endpoint"))
+        )
         form = {
-            "name": StringVar(value=safe_string(endpoint.get("name")) or f"Endpoint {index + 1}"),
+            "name": StringVar(value=safe_string(endpoint.get("name")) or f"PBX {index + 1}"),
             "endpoint": StringVar(value=safe_string(endpoint.get("endpoint"))),
             "token": StringVar(value=unprotect_secret(safe_string(endpoint.get("token")))),
             "username": StringVar(value=safe_string(endpoint.get("username"))),
             "password": StringVar(value=unprotect_secret(safe_string(endpoint.get("password")))),
             "auth_mode": StringVar(value=AUTH_LABELS.get(auth_mode, AUTH_LABELS[AUTH_TOKEN])),
+            "delivery_mode": StringVar(value=DELIVERY_LABELS[delivery_mode]),
+            "poll_seconds": IntVar(value=normalize_poll_seconds(endpoint.get("poll_seconds"))),
             "enabled": BooleanVar(value=bool(endpoint.get("enabled", index == 0))),
+            "reconnect_automatically": BooleanVar(value=bool(endpoint.get("reconnect_automatically", True))),
+            "allow_invalid_certificate": BooleanVar(value=bool(endpoint.get("allow_invalid_certificate", False))),
+            "allow_legacy_media": BooleanVar(value=bool(endpoint.get("allow_legacy_media", False))),
             "show_token": BooleanVar(value=False),
             "token_entry": None,
             "username_entry": None,
@@ -2296,26 +2813,67 @@ class SettingsWindow:
             "show_secrets_widget": None,
             "auth_hint_label": None,
             "warning_label": None,
+            "auth_combo": None,
+            "legacy_settings_frame": None,
         }
         self.endpoint_forms.append(form)
 
-        row_offset = 1
-        ttk.Label(parent, text=f"Endpoint {index + 1} configuration", style="Field.TLabel", font=("Segoe UI Semibold", 11)).grid(
+        ttk.Label(parent, text=f"PBX profile {index + 1}", style="Field.TLabel", font=("Segoe UI Semibold", 11)).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
         )
         ttk.Checkbutton(parent, text="Enabled", variable=form["enabled"], style="Inset.TCheckbutton").grid(
-            row=row_offset, column=0, sticky="w"
+            row=1, column=0, sticky="w"
         )
-        ttk.Label(parent, text="Authentication", style="Field.TLabel").grid(row=row_offset, column=1, sticky="e", padx=(18, 8))
-        auth_combo = ttk.Combobox(
+        delivery_combo = ttk.Combobox(
             parent,
+            textvariable=form["delivery_mode"],
+            values=list(DELIVERY_LABELS.values()),
+            state="readonly",
+            width=59,
+        )
+        delivery_combo.grid(row=1, column=1, columnspan=3, sticky="ew", padx=(12, 0))
+        delivery_combo.bind("<<ComboboxSelected>>", lambda _event, idx=index: self.update_delivery_mode(idx))
+
+        ttk.Label(parent, text="Display name", style="Field.TLabel").grid(row=2, column=0, sticky="w", pady=(14, 0))
+        ttk.Label(parent, text="PBX address", style="Field.TLabel").grid(
+            row=2, column=1, columnspan=3, sticky="w", pady=(14, 0)
+        )
+        ttk.Entry(parent, textvariable=form["name"], width=24).grid(
+            row=3, column=0, sticky="ew", pady=(4, 0), padx=(0, 10)
+        )
+        ttk.Entry(parent, textvariable=form["endpoint"], width=64).grid(
+            row=3, column=1, columnspan=3, sticky="ew", pady=(4, 0)
+        )
+
+        legacy_settings = ttk.Frame(parent, style="Inset.TFrame")
+        legacy_settings.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(14, 0))
+        form["legacy_settings_frame"] = legacy_settings
+        ttk.Label(legacy_settings, text="Legacy authentication", style="Field.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        auth_combo = ttk.Combobox(
+            legacy_settings,
             textvariable=form["auth_mode"],
-            values=list(AUTH_LABELS.values()),
+            values=[AUTH_LABELS[AUTH_BASIC], AUTH_LABELS[AUTH_TOKEN]],
             state="readonly",
             width=22,
         )
-        auth_combo.grid(row=row_offset, column=2, sticky="w")
+        auth_combo.grid(row=1, column=0, sticky="w", pady=(4, 0), padx=(0, 24))
         auth_combo.bind("<<ComboboxSelected>>", lambda _event, idx=index: self.update_auth_mode(idx))
+        form["auth_combo"] = auth_combo
+        ttk.Label(legacy_settings, text="Polling interval", style="Field.TLabel").grid(
+            row=0, column=1, columnspan=2, sticky="w"
+        )
+        ttk.Spinbox(
+            legacy_settings,
+            from_=5,
+            to=3600,
+            textvariable=form["poll_seconds"],
+            width=8,
+        ).grid(row=1, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(legacy_settings, text="seconds", style="Field.TLabel").grid(
+            row=1, column=2, sticky="w", padx=(8, 0), pady=(4, 0)
+        )
         show_secrets = ttk.Checkbutton(
             parent,
             text="Show secrets",
@@ -2323,59 +2881,68 @@ class SettingsWindow:
             command=lambda idx=index: self.toggle_token(idx),
             style="Inset.TCheckbutton",
         )
-        show_secrets.grid(row=row_offset, column=3, sticky="w", padx=(18, 0))
+        show_secrets.grid(row=5, column=3, sticky="e", padx=(18, 0), pady=(14, 0))
         form["show_secrets_widget"] = show_secrets
 
-        ttk.Label(parent, text="Display name", style="Field.TLabel").grid(row=row_offset + 1, column=0, sticky="w", pady=(14, 0))
-        ttk.Entry(parent, textvariable=form["name"], width=24).grid(
-            row=row_offset + 2, column=0, sticky="ew", pady=(4, 0), padx=(0, 10)
-        )
-
-        ttk.Label(parent, text="Endpoint URL", style="Field.TLabel").grid(
-            row=row_offset + 1, column=1, columnspan=3, sticky="w", pady=(14, 0)
-        )
-        ttk.Entry(parent, textvariable=form["endpoint"], width=64).grid(
-            row=row_offset + 2, column=1, columnspan=3, sticky="ew", pady=(4, 0)
-        )
-
         token_label = ttk.Label(parent, text="Bearer token", style="Field.TLabel")
-        token_label.grid(
-            row=row_offset + 3, column=0, columnspan=4, sticky="w", pady=(14, 0)
-        )
+        token_label.grid(row=6, column=0, columnspan=4, sticky="w", pady=(5, 0))
         token_entry = ttk.Entry(parent, textvariable=form["token"], width=80, show="*")
-        token_entry.grid(row=row_offset + 4, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        token_entry.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(4, 0))
         form["token_entry"] = token_entry
         form["token_widgets"] = [token_label, token_entry]
 
         username_label = ttk.Label(parent, text="Username", style="Field.TLabel")
-        username_label.grid(row=row_offset + 3, column=0, sticky="w", pady=(14, 0))
+        username_label.grid(row=6, column=0, sticky="w", pady=(5, 0))
         username_entry = ttk.Entry(parent, textvariable=form["username"], width=28)
-        username_entry.grid(row=row_offset + 4, column=0, sticky="ew", pady=(4, 0), padx=(0, 10))
+        username_entry.grid(row=7, column=0, sticky="ew", pady=(4, 0), padx=(0, 10))
         form["username_entry"] = username_entry
         password_label = ttk.Label(parent, text="Password", style="Field.TLabel")
-        password_label.grid(row=row_offset + 3, column=1, sticky="w", pady=(14, 0))
+        password_label.grid(row=6, column=1, sticky="w", pady=(5, 0))
         password_entry = ttk.Entry(parent, textvariable=form["password"], width=36, show="*")
-        password_entry.grid(row=row_offset + 4, column=1, columnspan=3, sticky="ew", pady=(4, 0))
+        password_entry.grid(row=7, column=1, columnspan=3, sticky="ew", pady=(4, 0))
         form["password_entry"] = password_entry
         form["basic_widgets"] = [username_label, username_entry, password_label, password_entry]
+        options = ttk.Frame(parent, style="Inset.TFrame")
+        options.grid(row=8, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        ttk.Checkbutton(
+            options,
+            text="Reconnect automatically",
+            variable=form["reconnect_automatically"],
+            style="Inset.TCheckbutton",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 16))
+        ttk.Checkbutton(
+            options,
+            text="Allow invalid certificate (unsafe)",
+            variable=form["allow_invalid_certificate"],
+            style="Inset.TCheckbutton",
+            command=lambda idx=index: self.update_endpoint_warning(idx),
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(
+            options,
+            text="Allow legacy HTTP media (unsafe)",
+            variable=form["allow_legacy_media"],
+            style="Inset.TCheckbutton",
+            command=lambda idx=index: self.update_endpoint_warning(idx),
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         auth_hint = ttk.Label(
             parent,
             text="Bearer token uses Authorization: Bearer. Username/password uses HTTP Basic auth. No authentication sends no Authorization header.",
             style="InsetHint.TLabel",
             wraplength=820,
         )
-        auth_hint.grid(row=row_offset + 5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        auth_hint.grid(row=9, column=0, columnspan=4, sticky="w", pady=(10, 0))
         form["auth_hint_label"] = auth_hint
         warning_label = ttk.Label(parent, text="", style="InsetHint.TLabel", wraplength=820)
-        warning_label.grid(row=row_offset + 6, column=0, columnspan=4, sticky="w", pady=(7, 0))
+        warning_label.grid(row=10, column=0, columnspan=4, sticky="w", pady=(7, 0))
         form["warning_label"] = warning_label
         parent.columnconfigure(0, weight=1)
         parent.columnconfigure(1, weight=1)
-        parent.columnconfigure(2, weight=1)
-        parent.columnconfigure(3, weight=1)
+        parent.columnconfigure(2, weight=0)
+        parent.columnconfigure(3, weight=0)
         form["endpoint"].trace_add("write", lambda *_args, idx=index: self.update_endpoint_warning(idx))
         form["auth_mode"].trace_add("write", lambda *_args, idx=index: self.update_auth_mode(idx))
-        self.update_auth_mode(index)
+        form["delivery_mode"].trace_add("write", lambda *_args, idx=index: self.update_delivery_mode(idx))
+        self.update_delivery_mode(index)
 
     def show_endpoint(self, index: int) -> None:
         if not 0 <= index < len(self.endpoint_panels):
@@ -2435,9 +3002,18 @@ class SettingsWindow:
         if label is None:
             return
         auth_mode = self.form_auth_mode(form)
-        warnings = endpoint_security_warnings(form["endpoint"].get().strip(), auth_mode)
+        address = form["endpoint"].get().strip()
+        try:
+            normalized_address = normalize_pbx_address(address) if address else ""
+        except ValueError:
+            normalized_address = address
+        warnings = endpoint_security_warnings(normalized_address, auth_mode)
+        if bool(form["allow_invalid_certificate"].get()):
+            warnings.append(("red", "Unsafe: TLS certificate and hostname validation is disabled for this PBX."))
+        if bool(form["allow_legacy_media"].get()):
+            warnings.append(("red", "Unsafe: unencrypted HTTP alert media is allowed for this PBX."))
         if not warnings:
-            label.configure(text="Security status: endpoint and authentication settings look normal.", style="InsetHint.TLabel")
+            label.configure(text="Security status: PBX and authentication settings look normal.", style="InsetHint.TLabel")
             return
         severity, _message = warnings[0]
         text = "\n".join(message for _severity, message in warnings)
@@ -2449,6 +3025,31 @@ class SettingsWindow:
             if selected == label:
                 return mode
         return AUTH_TOKEN
+
+    def form_delivery_mode(self, form: dict) -> str:
+        selected = form["delivery_mode"].get()
+        for mode, label in DELIVERY_LABELS.items():
+            if selected == label:
+                return mode
+        return DELIVERY_LIVE
+
+    def update_delivery_mode(self, index: int) -> None:
+        form = self.endpoint_forms[index]
+        live = self.form_delivery_mode(form) == DELIVERY_LIVE
+        legacy_settings = form.get("legacy_settings_frame")
+        auth_combo = form.get("auth_combo")
+        if live:
+            form["auth_mode"].set(AUTH_LABELS[AUTH_BASIC])
+            if legacy_settings is not None:
+                legacy_settings.grid_remove()
+        else:
+            if self.form_auth_mode(form) not in {AUTH_BASIC, AUTH_TOKEN}:
+                form["auth_mode"].set(AUTH_LABELS[AUTH_BASIC])
+            if legacy_settings is not None:
+                legacy_settings.grid()
+            if auth_combo is not None:
+                auth_combo.configure(state="readonly")
+        self.update_auth_mode(index)
 
     def toggle_token(self, index: int) -> None:
         form = self.endpoint_forms[index]
@@ -2480,44 +3081,60 @@ class SettingsWindow:
         auth_hint = form.get("auth_hint_label")
         if auth_hint is not None:
             hints = {
-                AUTH_TOKEN: "The token is sent as an Authorization: Bearer header and stored with Windows DPAPI.",
-                AUTH_BASIC: "The username and password are sent with HTTP Basic authentication. Use HTTPS to protect them in transit.",
+                AUTH_TOKEN: "The token is sent as an Authorization: Bearer header and stored in Windows Credential Manager.",
+                AUTH_BASIC: "Desktop-specific credentials use HTTP Basic over HTTPS and are stored in Windows Credential Manager.",
                 AUTH_NONE: "No Authorization header will be sent. Use this only for a trusted endpoint designed for anonymous access.",
             }
             auth_hint.configure(text=hints[mode])
+            if self.form_delivery_mode(form) == DELIVERY_LIVE:
+                auth_hint.configure(
+                    text="Live mode uses desktop-specific Basic credentials, waits for the authenticated SSE event, and resumes with Last-Event-ID."
+                )
         for key in ("token_entry", "username_entry", "password_entry"):
             entry = form.get(key)
             if entry is not None:
                 entry.configure(state="normal")
         self.update_endpoint_warning(index)
 
-    def collect_settings(self) -> tuple[list[dict], int] | None:
-        try:
-            interval = int(self.interval_var.get())
-        except Exception:
-            interval = DEFAULT_POLL_SECONDS
-        interval = max(5, interval)
-
+    def collect_settings(self) -> list[dict] | None:
         endpoints: list[dict] = []
         security_messages: list[str] = []
         active_count = 0
         for index, form in enumerate(self.endpoint_forms):
-            name = form["name"].get().strip() or f"Endpoint {index + 1}"
-            url = form["endpoint"].get().strip()
+            name = form["name"].get().strip() or f"PBX {index + 1}"
+            raw_url = form["endpoint"].get().strip()
+            try:
+                url = normalize_pbx_address(raw_url) if raw_url else ""
+            except ValueError as exc:
+                messagebox.showerror("PBX address", f"PBX profile {index + 1}: {exc}")
+                return None
             token = form["token"].get().strip()
             username = form["username"].get().strip()
             password = form["password"].get().strip()
             auth_mode = self.form_auth_mode(form)
+            delivery_mode = self.form_delivery_mode(form)
+            if delivery_mode == DELIVERY_LIVE:
+                auth_mode = AUTH_BASIC
+            try:
+                endpoint_interval = normalize_poll_seconds(form["poll_seconds"].get())
+            except Exception:
+                endpoint_interval = DEFAULT_POLL_SECONDS
             no_token = auth_mode == AUTH_NONE
             endpoint_enabled = bool(form["enabled"].get())
 
             if url and not endpoint_url_allowed(url):
                 messagebox.showerror(
-                    "Endpoint URL",
-                    f"Endpoint {index + 1} must be a valid http:// or https:// URL.",
+                    "PBX address",
+                    f"PBX profile {index + 1} must be a valid http:// or https:// hostname or URL.",
                 )
                 return None
             if endpoint_enabled and url:
+                if delivery_mode == DELIVERY_LIVE and urlparse(url).scheme.lower() != "https":
+                    messagebox.showerror(
+                        "HTTPS required",
+                        f"PBX profile {index + 1} must use HTTPS for the live authenticated handshake.",
+                    )
+                    return None
                 if auth_mode == AUTH_TOKEN and not token:
                     messagebox.showerror(
                         "Token required",
@@ -2532,7 +3149,22 @@ class SettingsWindow:
                     return None
                 for _severity, warning in endpoint_security_warnings(url, auth_mode):
                     security_messages.append(f"Endpoint {index + 1}: {warning}")
+                if bool(form["allow_invalid_certificate"].get()):
+                    security_messages.append(
+                        f"PBX profile {index + 1}: TLS certificate and hostname validation will be disabled."
+                    )
+                if bool(form["allow_legacy_media"].get()):
+                    security_messages.append(
+                        f"PBX profile {index + 1}: unencrypted HTTP alert media will be allowed."
+                    )
                 active_count += 1
+
+            stored_token = ""
+            stored_password = ""
+            if auth_mode == AUTH_TOKEN:
+                stored_token = token
+            elif auth_mode == AUTH_BASIC:
+                stored_password = password
 
             endpoints.append(
                 {
@@ -2540,12 +3172,20 @@ class SettingsWindow:
                     "endpoint": url,
                     "enabled": endpoint_enabled,
                     "auth_mode": auth_mode,
+                    "delivery_mode": delivery_mode,
+                    "poll_seconds": endpoint_interval,
+                    "reconnect_automatically": bool(form["reconnect_automatically"].get()),
+                    "allow_invalid_certificate": bool(form["allow_invalid_certificate"].get()),
+                    "allow_legacy_media": bool(form["allow_legacy_media"].get()),
                     "no_token": no_token,
-                    "token": protect_secret(token) if auth_mode == AUTH_TOKEN else "",
+                    "token": stored_token,
                     "username": username if auth_mode == AUTH_BASIC else "",
-                    "password": protect_secret(password) if auth_mode == AUTH_BASIC else "",
+                    "password": stored_password,
                     "last_event_id": self.app.get_endpoint_state(index, "last_event_id"),
                     "last_fingerprint": self.app.get_endpoint_state(index, "last_fingerprint"),
+                    "recent_event_ids": normalize_endpoint(
+                        normalize_endpoints(self.app.get_config())[index], index
+                    ).get("recent_event_ids", []),
                 }
             )
 
@@ -2559,25 +3199,41 @@ class SettingsWindow:
             + "\n\nSave these settings anyway?",
         ):
             return None
-        return endpoints, interval
+        for index, endpoint in enumerate(endpoints):
+            auth_mode = normalize_auth_mode(endpoint.get("auth_mode"), bool(endpoint.get("no_token")))
+            if auth_mode == AUTH_TOKEN:
+                endpoint["token"] = protect_profile_secret(index, "token", safe_string(endpoint.get("token")))
+                endpoint["password"] = ""
+                delete_profile_secret(index, "password")
+            elif auth_mode == AUTH_BASIC:
+                endpoint["password"] = protect_profile_secret(
+                    index, "password", safe_string(endpoint.get("password"))
+                )
+                endpoint["token"] = ""
+                delete_profile_secret(index, "token")
+            else:
+                endpoint["token"] = ""
+                endpoint["password"] = ""
+                delete_profile_secret(index, "token")
+                delete_profile_secret(index, "password")
+        return endpoints
 
     def save(self) -> bool:
         collected = self.collect_settings()
         if collected is None:
             return False
-        endpoints, interval = collected
+        endpoints = collected
         self.app.update_settings(
             endpoints=endpoints,
             enabled=self.enabled_var.get(),
             startup_enabled=self.startup_var.get(),
             auto_update_enabled=self.auto_update_var.get(),
-            poll_seconds=interval,
             audio_sound=safe_audio_name(self.audio_var.get() or DEFAULT_AUDIO_NAME),
         )
         if self.monitor_badge is not None:
             enabled = bool(self.enabled_var.get())
             self.monitor_badge.configure(
-                text="MONITORING ON" if enabled else "MONITORING OFF",
+                text="Monitoring enabled" if enabled else "Monitoring disabled",
                 style="BadgeOn.TLabel" if enabled else "BadgeOff.TLabel",
             )
         active_count = sum(bool(form["enabled"].get() and form["endpoint"].get().strip()) for form in self.endpoint_forms)
@@ -2587,8 +3243,17 @@ class SettingsWindow:
     def test_now(self) -> None:
         if not self.save():
             return
-        self.status_label.configure(text="Testing active endpoints...")
-        self.app.test_now(lambda message: self.status_label.configure(text=message))
+        if self.test_button is not None:
+            self.test_button.configure(state="disabled")
+        self.status_label.configure(text="Testing PBX connections and waiting for authenticated handshakes...")
+        self.app.test_now(self.finish_connection_test)
+
+    def finish_connection_test(self, message: str) -> None:
+        if not self.window.winfo_exists():
+            return
+        self.status_label.configure(text=message)
+        if self.test_button is not None:
+            self.test_button.configure(state="normal")
 
     def close(self) -> None:
         self.window.destroy()
@@ -2596,6 +3261,407 @@ class SettingsWindow:
 
     def quit_app(self) -> None:
         self.app.shutdown()
+
+
+def endpoint_poll_seconds(endpoint_cfg: dict, fallback: int = DEFAULT_POLL_SECONDS) -> int:
+    return normalize_poll_seconds(endpoint_cfg.get("poll_seconds", fallback), fallback)
+
+
+def endpoint_worker_signature(endpoint_cfg: dict, poll_seconds: int | None = None) -> str:
+    keys = (
+        "endpoint",
+        "enabled",
+        "auth_mode",
+        "token",
+        "username",
+        "password",
+        "delivery_mode",
+        "reconnect_automatically",
+        "allow_invalid_certificate",
+        "allow_legacy_media",
+    )
+    selected = {key: endpoint_cfg.get(key) for key in keys}
+    selected["poll_seconds"] = endpoint_poll_seconds(
+        endpoint_cfg, DEFAULT_POLL_SECONDS if poll_seconds is None else poll_seconds
+    )
+    return json.dumps(selected, sort_keys=True, separators=(",", ":"))
+
+
+def notification_routed_to_client(payload: object, endpoint_cfg: dict) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    auth_mode = normalize_auth_mode(endpoint_cfg.get("auth_mode"), bool(endpoint_cfg.get("no_token")))
+    # Preserve compatibility for pre-handshake bearer/anonymous sources. Desktop Basic profiles
+    # use the PBX routing contract as a defense-in-depth boundary.
+    if auth_mode != AUTH_BASIC:
+        return True
+    if payload.get("desktop_all") is True:
+        return True
+    username = safe_string(endpoint_cfg.get("username"))
+    recipients = payload.get("desktop_recipients")
+    if isinstance(recipients, str):
+        recipients = [recipients]
+    if isinstance(recipients, list):
+        return username in {safe_string(item) for item in recipients}
+    return False
+
+
+def polling_records(data: object, last_event_id: str) -> list[dict]:
+    if not isinstance(data, dict):
+        return []
+    latest = data.get("latest")
+    events = [item for item in data.get("events", []) if isinstance(item, dict)] if isinstance(data.get("events"), list) else []
+    if not last_event_id:
+        return [latest] if isinstance(latest, dict) else []
+    if isinstance(latest, dict) and safe_string(lookup(latest, EVENT_ID_KEYS)) == last_event_id:
+        return []
+    start = 0
+    for position, record in enumerate(events):
+        if safe_string(lookup(record, EVENT_ID_KEYS)) == last_event_id:
+            if events and isinstance(latest, dict) and safe_string(lookup(events[0], EVENT_ID_KEYS)) == safe_string(
+                lookup(latest, EVENT_ID_KEYS)
+            ):
+                events = events[:position]
+                start = 0
+            else:
+                start = position + 1
+            break
+    records = events[start:]
+    if isinstance(latest, dict):
+        latest_id = safe_string(lookup(latest, EVENT_ID_KEYS))
+        if not any(safe_string(lookup(item, EVENT_ID_KEYS)) == latest_id for item in records):
+            records.append(latest)
+    return records
+
+
+class EndpointTransportWorker:
+    def __init__(self, app: "MassNotifyApp", index: int, endpoint_cfg: dict, poll_seconds: int) -> None:
+        self.app = app
+        self.index = index
+        self.endpoint_cfg = normalize_endpoint(endpoint_cfg, index)
+        self.poll_seconds = max(5, int(poll_seconds))
+        self.signature = endpoint_worker_signature(self.endpoint_cfg, self.poll_seconds)
+        self.stop_event = threading.Event()
+        self.response_lock = threading.Lock()
+        self.response = None
+        self.last_activity = 0.0
+        self.session_id = ""
+        self.client_id = ""
+        self.server_retry_seconds = 1.0
+        self.authenticated_event = threading.Event()
+        self.catchup_thread: threading.Thread | None = None
+        self.thread = threading.Thread(
+            target=self.run,
+            name=f"PBXTransport-{index + 1}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        mode = normalize_delivery_mode(
+            self.endpoint_cfg.get("delivery_mode"), existing_url=safe_string(self.endpoint_cfg.get("endpoint"))
+        )
+        if mode == DELIVERY_LIVE:
+            self.catchup_thread = threading.Thread(
+                target=self._run_live_catchup,
+                name=f"PBXLiveCatchup-{self.index + 1}",
+                daemon=True,
+            )
+            self.catchup_thread.start()
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.authenticated_event.set()
+        with self.response_lock:
+            response = self.response
+            self.response = None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def _track_response(self, response) -> None:
+        with self.response_lock:
+            self.response = response
+
+    def _release_response(self, response) -> None:
+        with self.response_lock:
+            if self.response is response:
+                self.response = None
+        try:
+            response.close()
+        except Exception:
+            pass
+
+    def _status(self, state: str, detail: str) -> None:
+        self.app.set_transport_status(self.index, state, detail)
+
+    def _fault(self, message: str) -> None:
+        key = f"endpoint-{self.index}"
+        self.app.record_fault(key, message)
+        log(message)
+
+    def run(self) -> None:
+        mode = normalize_delivery_mode(
+            self.endpoint_cfg.get("delivery_mode"), existing_url=safe_string(self.endpoint_cfg.get("endpoint"))
+        )
+        if mode == DELIVERY_LIVE:
+            self._run_live()
+        else:
+            self._run_polling()
+
+    def _run_polling(self) -> None:
+        name = endpoint_display_name(self.index, self.endpoint_cfg)
+        while not self.stop_event.is_set():
+            self._status("CONNECTING", f"{name}: checking legacy JSON fallback")
+            try:
+                url = pbx_transport_url(self.endpoint_cfg, DELIVERY_POLL)
+                data, raw_text = fetch_endpoint(
+                    url,
+                    endpoint_auth_headers(self.endpoint_cfg),
+                    allow_invalid_certificate=bool(self.endpoint_cfg.get("allow_invalid_certificate", False)),
+                )
+                ensure_api_ok(data)
+                last_id = self.app.get_endpoint_state(self.index, "last_event_id")
+                for record in polling_records(data, last_id):
+                    self._accept_payload(record, json.dumps(record, ensure_ascii=False))
+                self.app.clear_fault(f"endpoint-{self.index}")
+                self._status(
+                    "POLLING",
+                    f"{name}: legacy polling OK at {datetime.now().strftime('%H:%M:%S')}",
+                )
+            except UnauthorizedError as exc:
+                if self.stop_event.is_set():
+                    return
+                message = f"{name}: {exc}"
+                self._status("AUTH_FAILED", message)
+                self._fault(message)
+                self.stop_event.wait()
+                return
+            except TlsRequiredError as exc:
+                if self.stop_event.is_set():
+                    return
+                message = f"{name}: {exc}"
+                self._status("TLS_REQUIRED", message)
+                self._fault(message)
+                self.stop_event.wait()
+                return
+            except RateLimitedError as exc:
+                if self.stop_event.is_set():
+                    return
+                message = f"{name}: {exc}"
+                self._status("RATE_LIMITED", message)
+                self._fault(message)
+                if self.stop_event.wait(60):
+                    return
+                continue
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    return
+                message = f"{name}: polling failed: {safe_string(exc)}"
+                self._status("RECONNECTING", message)
+                self._fault(message)
+            if self.stop_event.wait(self.poll_seconds):
+                return
+
+    def _run_live(self) -> None:
+        name = endpoint_display_name(self.index, self.endpoint_cfg)
+        backoff_index = 0
+        while not self.stop_event.is_set():
+            self.authenticated_event.clear()
+            authenticated_this_attempt = False
+            self.authenticated_this_attempt = False
+            self._status("CONNECTING", f"{name}: opening authenticated live stream")
+            try:
+                response = open_sse_response(self.endpoint_cfg)
+                self._track_response(response)
+                try:
+                    authenticated_this_attempt, reconnect_requested = self._consume_stream(response)
+                finally:
+                    self.authenticated_event.clear()
+                    self._release_response(response)
+                if self.stop_event.is_set():
+                    return
+                if not authenticated_this_attempt:
+                    raise StreamProtocolError("The stream ended before the authenticated handshake.")
+                backoff_index = 0
+                if not bool(self.endpoint_cfg.get("reconnect_automatically", True)):
+                    self._status("DISCONNECTED", f"{name}: live stream closed; automatic reconnect is off")
+                    self.stop_event.wait()
+                    return
+                delay = random.uniform(0.1, 0.8) if reconnect_requested else self.server_retry_seconds
+                self._status("RECONNECTING", f"{name}: renewing live stream")
+                if self.stop_event.wait(delay):
+                    return
+
+                continue
+            except UnauthorizedError as exc:
+                if self.stop_event.is_set():
+                    return
+                message = f"{name}: {exc}"
+                self._status("AUTH_FAILED", message)
+                self._fault(message)
+                self.stop_event.wait()
+                return
+            except TlsRequiredError as exc:
+                if self.stop_event.is_set():
+                    return
+                message = f"{name}: {exc}"
+                self._status("TLS_REQUIRED", message)
+                self._fault(message)
+                self.stop_event.wait()
+                return
+            except RateLimitedError as exc:
+                if self.stop_event.is_set():
+                    return
+                message = f"{name}: {exc}"
+                self._status("RATE_LIMITED", message)
+                self._fault(message)
+                if self.stop_event.wait(60):
+                    return
+                continue
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    return
+                if self.authenticated_this_attempt:
+                    backoff_index = 0
+                message = f"{name}: live transport fault: {safe_string(exc)}"
+                self._fault(message)
+                if not bool(self.endpoint_cfg.get("reconnect_automatically", True)):
+                    self._status("DISCONNECTED", message)
+                    self.stop_event.wait()
+                    return
+                delay = RECONNECT_BACKOFF_SECONDS[min(backoff_index, len(RECONNECT_BACKOFF_SECONDS) - 1)]
+                backoff_index = min(backoff_index + 1, len(RECONNECT_BACKOFF_SECONDS) - 1)
+                delay = min(30.0, delay + random.uniform(0.0, max(0.25, delay * 0.2)))
+                self._status("RECONNECTING", f"{message}; retrying in {delay:.1f}s")
+                if self.stop_event.wait(delay):
+                    return
+
+    def _run_live_catchup(self) -> None:
+        """Recover notifications the PBX did not emit on an authenticated live stream."""
+        while not self.stop_event.is_set():
+            if not self.authenticated_event.wait(1):
+                continue
+            if self.stop_event.is_set():
+                return
+            try:
+                accepted = self._live_catchup_once()
+                if accepted:
+                    log(
+                        f"{endpoint_display_name(self.index, self.endpoint_cfg)} recovered "
+                        f"{accepted} missed live notification{'s' if accepted != 1 else ''}"
+                    )
+                delay = LIVE_CATCHUP_SECONDS
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    return
+                log(
+                    f"{endpoint_display_name(self.index, self.endpoint_cfg)} live notification catch-up failed: "
+                    f"{safe_string(exc)}"
+                )
+                delay = max(15, LIVE_CATCHUP_SECONDS)
+            if self.stop_event.wait(delay):
+                return
+
+    def _live_catchup_once(self) -> int:
+        data, raw_text = fetch_endpoint(
+            pbx_transport_url(self.endpoint_cfg, DELIVERY_POLL),
+            endpoint_auth_headers(self.endpoint_cfg),
+            allow_invalid_certificate=bool(self.endpoint_cfg.get("allow_invalid_certificate", False)),
+        )
+        ensure_api_ok(data)
+        last_id = self.app.get_endpoint_state(self.index, "last_event_id")
+        accepted = 0
+        for record in polling_records(data, last_id):
+            if self._accept_payload(
+                record,
+                json.dumps(record, ensure_ascii=False) if isinstance(record, dict) else raw_text,
+                delivery_source="live catch-up",
+            ):
+                accepted += 1
+        return accepted
+
+    def _consume_stream(self, response) -> tuple[bool, bool]:
+        authenticated = False
+        reconnect_requested = False
+
+        def activity() -> None:
+            self.last_activity = time.monotonic()
+
+        for event in iter_sse_events(response, on_activity=activity, stop_event=self.stop_event):
+            if event.retry_ms is not None:
+                self.server_retry_seconds = max(0.1, event.retry_ms / 1000.0)
+            if event.name == "authenticated":
+                if authenticated:
+                    raise StreamProtocolError("PBX sent a duplicate authenticated event.")
+                try:
+                    payload = json.loads(event.data)
+                except json.JSONDecodeError as exc:
+                    raise StreamProtocolError("PBX sent an invalid authenticated event.") from exc
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("ok") is not True
+                    or safe_string(payload.get("transport")) != "live_sse"
+                ):
+                    raise StreamProtocolError("PBX rejected the live authentication handshake.")
+                authenticated = True
+                self.authenticated_this_attempt = True
+                self.authenticated_event.set()
+                self.session_id = bounded_text(payload.get("session_id"), 160)
+                self.client_id = bounded_text(payload.get("client_id"), 160)
+                self.app.clear_fault(f"endpoint-{self.index}")
+                unsafe = " (certificate validation disabled)" if self.endpoint_cfg.get("allow_invalid_certificate") else ""
+                log(f"{endpoint_display_name(self.index, self.endpoint_cfg)} live handshake authenticated")
+                self._status(
+                    "AUTHENTICATED",
+                    f"{endpoint_display_name(self.index, self.endpoint_cfg)}: live authenticated{unsafe}",
+                )
+                continue
+            if not authenticated:
+                raise StreamProtocolError(f"PBX sent '{event.name}' before authentication completed.")
+            if event.name == "notification":
+                try:
+                    payload = json.loads(event.data)
+                except json.JSONDecodeError as exc:
+                    raise StreamProtocolError("PBX sent invalid notification JSON.") from exc
+                self._accept_payload(payload, event.data, event.event_id, delivery_source="live stream")
+            elif event.name == "reconnect":
+                reconnect_requested = True
+                break
+        return authenticated, reconnect_requested
+
+    def _accept_payload(
+        self,
+        payload: object,
+        raw_text: str,
+        stream_event_id: str = "",
+        *,
+        delivery_source: str = "legacy polling",
+    ) -> bool:
+        if not notification_routed_to_client(payload, self.endpoint_cfg):
+            event_id = safe_string(lookup(payload, EVENT_ID_KEYS)) if isinstance(payload, dict) else ""
+            log(
+                f"{endpoint_display_name(self.index, self.endpoint_cfg)} ignored {delivery_source} notification"
+                f"{f' {event_id}' if event_id else ''} outside its desktop route"
+            )
+            return False
+        alert = extract_alert(payload, raw_text)
+        if stream_event_id:
+            alert.event_id = stream_event_id
+        normalize_alert_urls(alert, safe_string(self.endpoint_cfg.get("endpoint")), self.endpoint_cfg)
+        accepted = self.app.accept_alert(self.index, alert, self.signature)
+        if accepted:
+            log(
+                f"{endpoint_display_name(self.index, self.endpoint_cfg)} accepted {delivery_source} "
+                f"{alert.kind or 'notification'}{f' {alert.event_id}' if alert.event_id else ''}"
+            )
+        if accepted and alert.event_id:
+            # The same worker reconnects after the PBX's bounded stream closes, so keep its
+            # request snapshot current as well as the persisted profile state.
+            self.endpoint_cfg["last_event_id"] = alert.event_id
+        return accepted
 
 
 class MassNotifyApp:
@@ -2614,16 +3680,21 @@ class MassNotifyApp:
         self.config = load_config()
         self.stop_event = threading.Event()
         self.wakeup_event = threading.Event()
+        self.connection_test_event = threading.Event()
+        self.worker_lock = threading.RLock()
+        self.workers: dict[int, EndpointTransportWorker] = {}
+        self.faults_lock = threading.RLock()
         self.ui_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.settings_window: SettingsWindow | None = None
-        self.status_text = "Waiting for first endpoint check."
+        self.status_text = "Waiting for PBX connection."
+        self.transport_statuses: dict[int, tuple[str, str]] = {}
         self.faults: dict[str, dict] = {}
 
         self.command_thread = threading.Thread(target=self.command_server, name="CommandServer", daemon=True)
         self.command_thread.start()
 
-        self.poll_thread = threading.Thread(target=self.poll_loop, name="EndpointPoller", daemon=True)
-        self.poll_thread.start()
+        self.monitor_thread = threading.Thread(target=self.monitor_loop, name="PBXMonitor", daemon=True)
+        self.monitor_thread.start()
 
         self.update_thread = threading.Thread(target=self.update_loop, name="AutoUpdater", daemon=True)
         self.update_thread.start()
@@ -2655,7 +3726,6 @@ class MassNotifyApp:
         enabled: bool,
         startup_enabled: bool,
         auto_update_enabled: bool,
-        poll_seconds: int,
         audio_sound: str,
     ) -> None:
         with self.config_lock:
@@ -2670,7 +3740,6 @@ class MassNotifyApp:
             self.config["enabled"] = bool(enabled)
             self.config["startup_enabled"] = bool(startup_enabled)
             self.config["auto_update_enabled"] = bool(auto_update_enabled)
-            self.config["poll_seconds"] = int(poll_seconds)
             self.config["audio_sound"] = safe_audio_name(audio_sound or DEFAULT_AUDIO_NAME)
             self.config = normalize_config(self.config)
             save_config(self.config)
@@ -2698,96 +3767,111 @@ class MassNotifyApp:
 
     def record_fault(self, key: str, message: str) -> None:
         now = time.monotonic()
-        fault = self.faults.get(key)
-        if fault is None or fault.get("message") != message:
-            self.faults[key] = {"message": message, "started_at": now, "notified": False}
-            return
-        if (
-            fault.get("started_at") is not None
-            and not fault.get("notified")
-            and now - float(fault.get("started_at", now)) >= FAULT_NOTIFY_SECONDS
-        ):
-            fault["notified"] = True
-            self.ui_queue.put(
-                (
-                    "fault",
-                    f"{message} This has been unresolved for at least 5 minutes.",
+        with self.faults_lock:
+            fault = self.faults.get(key)
+            if fault is None or fault.get("message") != message:
+                self.faults[key] = {"message": message, "started_at": now, "notified": False}
+                return
+            if (
+                fault.get("started_at") is not None
+                and not fault.get("notified")
+                and now - float(fault.get("started_at", now)) >= FAULT_NOTIFY_SECONDS
+            ):
+                fault["notified"] = True
+                self.ui_queue.put(
+                    (
+                        "fault",
+                        f"{message} This has been unresolved for at least 5 minutes.",
+                    )
                 )
-            )
 
     def clear_fault(self, key: str | None = None) -> None:
-        if key is None:
-            self.faults.clear()
-        else:
-            self.faults.pop(key, None)
+        with self.faults_lock:
+            if key is None:
+                self.faults.clear()
+            else:
+                self.faults.pop(key, None)
 
-    def poll_loop(self) -> None:
+    def set_transport_status(self, index: int, state: str, detail: str) -> None:
+        with self.worker_lock:
+            self.transport_statuses[index] = (state, detail)
+            states = [value[0] for value in self.transport_statuses.values()]
+            if "AUTHENTICATED" in states:
+                live_count = states.count("AUTHENTICATED")
+                self.status_text = f"Live authenticated: {live_count} PBX profile{'s' if live_count != 1 else ''}. {detail}"
+            else:
+                self.status_text = detail
+        self.ui_queue.put(("status", self.status_text))
+
+    def accept_alert(self, index: int, alert: AlertData, worker_signature: str = "") -> bool:
+        dedupe_id = safe_string(alert.event_id)
+        with self.config_lock:
+            self.config = normalize_config(self.config)
+            if not 0 <= index < len(self.config["endpoints"]):
+                return False
+            endpoint = self.config["endpoints"][index]
+            current_interval = endpoint_poll_seconds(
+                endpoint, normalize_poll_seconds(self.config.get("poll_seconds", DEFAULT_POLL_SECONDS))
+            )
+            if worker_signature and endpoint_worker_signature(endpoint, current_interval) != worker_signature:
+                return False
+            recent_ids = [safe_string(item) for item in endpoint.get("recent_event_ids", []) if safe_string(item)]
+            if dedupe_id and (dedupe_id in recent_ids or dedupe_id == safe_string(endpoint.get("last_event_id"))):
+                return False
+            if not dedupe_id and alert.fingerprint == safe_string(endpoint.get("last_fingerprint")):
+                return False
+            if dedupe_id:
+                recent_ids.append(dedupe_id)
+                endpoint["recent_event_ids"] = recent_ids[-RECENT_EVENT_ID_LIMIT:]
+                endpoint["last_event_id"] = dedupe_id
+            endpoint["last_fingerprint"] = alert.fingerprint
+            first = self.config["endpoints"][0]
+            self.config["endpoint"] = first.get("endpoint", "")
+            self.config["token"] = first.get("token", "")
+            self.config["last_event_id"] = first.get("last_event_id", "")
+            self.config["last_fingerprint"] = first.get("last_fingerprint", "")
+            save_config(self.config)
+        self.ui_queue.put(("alert", alert))
+        return True
+
+    def monitor_loop(self) -> None:
         while not self.stop_event.is_set():
             with self.config_lock:
                 cfg = normalize_config(dict(self.config))
             enabled = bool(cfg.get("enabled", True))
-            interval = max(5, int(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS) or DEFAULT_POLL_SECONDS))
-
-            endpoints = active_endpoints(cfg) if enabled else []
-            if endpoints:
-                ok_count = 0
-                for index, endpoint_cfg in endpoints:
-                    endpoint = safe_string(endpoint_cfg.get("endpoint"))
-                    auth_headers = endpoint_auth_headers(endpoint_cfg)
-                    fault_key = f"endpoint-{index}"
-                    try:
-                        data, raw_text = fetch_endpoint(endpoint, auth_headers)
-                        ensure_api_ok(data)
-                        alert = extract_alert(data, raw_text)
-                        normalize_alert_urls(alert, endpoint)
-                        self.clear_fault(fault_key)
-                        ok_count += 1
-                        dedupe_key = alert.event_id or alert.fingerprint
-                        last_seen = (
-                            endpoint_cfg.get("last_event_id")
-                            if alert.event_id
-                            else endpoint_cfg.get("last_fingerprint")
-                        )
-                        if dedupe_key and dedupe_key != last_seen:
-                            with self.config_lock:
-                                self.config = normalize_config(self.config)
-                                self.config["endpoints"][index]["last_event_id"] = (
-                                    alert.event_id or self.config["endpoints"][index].get("last_event_id", "")
-                                )
-                                self.config["endpoints"][index]["last_fingerprint"] = alert.fingerprint
-                                first = self.config["endpoints"][0]
-                                self.config["endpoint"] = first.get("endpoint", "")
-                                self.config["token"] = first.get("token", "")
-                                self.config["last_event_id"] = first.get("last_event_id", "")
-                                self.config["last_fingerprint"] = first.get("last_fingerprint", "")
-                                save_config(self.config)
-                            self.ui_queue.put(("alert", alert))
-                    except UnauthorizedError as exc:
-                        message = f"{endpoint_display_name(index, endpoint_cfg)} authorization fault: {exc}"
-                        self.status_text = message
-                        self.record_fault(fault_key, message)
-                        log(message)
-                    except ApiError as exc:
-                        message = f"{endpoint_display_name(index, endpoint_cfg)} endpoint check failed: {exc}"
-                        self.status_text = message
-                        self.record_fault(fault_key, message)
-                        log(message)
-                    except Exception as exc:
-                        message = f"{endpoint_display_name(index, endpoint_cfg)} unexpected poll error: {exc}"
-                        self.status_text = message
-                        self.record_fault(fault_key, message)
-                        log(message)
-                if ok_count:
-                    total = len(endpoints)
-                    self.status_text = (
-                        f"Last checked {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: "
-                        f"{ok_count}/{total} endpoint{'s' if total != 1 else ''} OK"
+            legacy_default_interval = normalize_poll_seconds(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS))
+            desired = {
+                index: endpoint_cfg
+                for index, endpoint_cfg in (
+                    active_endpoints(cfg) if enabled else []
+                )
+            }
+            with self.worker_lock:
+                for index, worker in list(self.workers.items()):
+                    candidate = desired.get(index)
+                    candidate_interval = (
+                        endpoint_poll_seconds(candidate, legacy_default_interval) if candidate is not None else None
                     )
-            else:
+                    if candidate is None or worker.signature != endpoint_worker_signature(candidate, candidate_interval):
+                        worker.stop()
+                        if not worker.thread.is_alive():
+                            self.workers.pop(index, None)
+                            self.transport_statuses.pop(index, None)
+                for index, endpoint_cfg in desired.items():
+                    if index not in self.workers:
+                        worker = EndpointTransportWorker(
+                            self,
+                            index,
+                            endpoint_cfg,
+                            endpoint_poll_seconds(endpoint_cfg, legacy_default_interval),
+                        )
+                        self.workers[index] = worker
+                        worker.start()
+            if not desired:
                 self.clear_fault()
-                self.status_text = "Disabled or waiting for endpoint settings."
-
-            self.wakeup_event.wait(interval)
+                self.status_text = monitoring_idle_status(cfg)
+                self.ui_queue.put(("status", self.status_text))
+            self.wakeup_event.wait(1)
             self.wakeup_event.clear()
 
     def update_loop(self) -> None:
@@ -2877,18 +3961,28 @@ class MassNotifyApp:
                 kind, value = self.ui_queue.get_nowait()
             except queue.Empty:
                 break
-            if kind == "alert" and isinstance(value, AlertData):
-                self.present_alert(value)
-            elif kind == "fault":
-                FaultToast(self, safe_string(value))
-            elif kind == "settings":
-                self.show_settings()
+            try:
+                if kind == "alert" and isinstance(value, AlertData):
+                    self.present_alert(value)
+                elif kind == "fault":
+                    FaultToast(self, safe_string(value))
+                elif kind == "settings":
+                    self.show_settings()
+                elif kind == "status":
+                    if self.settings_window is not None and self.settings_window.window.winfo_exists():
+                        self.settings_window.status_label.configure(text=safe_string(value))
+                elif kind == "test_result" and isinstance(value, tuple) and len(value) == 2:
+                    callback, message = value
+                    callback(message)
+            except Exception as exc:
+                log(f"UI dispatch failed for {safe_string(kind)}: {safe_string(exc)}")
         if not self.stop_event.is_set():
             self.root.after(200, self.process_ui_queue)
 
     def present_alert(self, alert: AlertData) -> None:
         with self.config_lock:
             audio_name = safe_audio_name(safe_string(self.config.get("audio_sound")) or DEFAULT_AUDIO_NAME)
+        log(f"presenting {alert.kind or 'notification'}{f' {alert.event_id}' if alert.event_id else ''}")
         play_alert_sound(audio_name)
         AlertWindow(self, alert)
 
@@ -2899,55 +3993,119 @@ class MassNotifyApp:
             return
         self.settings_window = SettingsWindow(self)
 
-    def test_now(self, callback) -> None:
-        def worker() -> None:
-            with self.config_lock:
-                cfg = normalize_config(dict(self.config))
-            endpoints = active_endpoints(cfg)
-            if not endpoints:
-                message = "No active endpoints are configured."
-                self.status_text = message
-                self.root.after(0, lambda: callback(message))
-                return
+    def transport_is_authenticated(self, index: int, endpoint_cfg: dict, poll_seconds: int) -> bool:
+        """Use the live worker as the connection test when it is already healthy."""
+        with self.worker_lock:
+            worker = self.workers.get(index)
+            status = self.transport_statuses.get(index)
+            return bool(
+                worker is not None
+                and worker.thread.is_alive()
+                and worker.signature == endpoint_worker_signature(endpoint_cfg, poll_seconds)
+                and status is not None
+                and status[0] == "AUTHENTICATED"
+            )
 
+    def test_now(self, callback) -> None:
+        if self.connection_test_event.is_set():
+            self.ui_queue.put(("test_result", (callback, "A connection test is already running.")))
+            return
+        self.connection_test_event.set()
+
+        def worker() -> None:
             failures: list[str] = []
             successes = 0
-            first_alert: AlertData | None = None
-            for index, endpoint_cfg in endpoints:
-                endpoint = safe_string(endpoint_cfg.get("endpoint"))
-                auth_headers = endpoint_auth_headers(endpoint_cfg)
-                try:
-                    data, raw_text = fetch_endpoint(endpoint, auth_headers)
-                    ensure_api_ok(data)
-                    alert = extract_alert(data, raw_text)
-                    normalize_alert_urls(alert, endpoint)
-                    successes += 1
-                    if first_alert is None:
-                        first_alert = alert
-                except Exception as exc:
-                    failures.append(f"{endpoint_display_name(index, endpoint_cfg)}: {exc}")
+            message = "Connection test ended unexpectedly."
+            try:
+                with self.config_lock:
+                    cfg = normalize_config(dict(self.config))
+                endpoints = active_endpoints(cfg)
+                legacy_default_interval = normalize_poll_seconds(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS))
+                if not endpoints:
+                    message = "No active endpoints are configured."
+                    return
 
-            if first_alert is not None:
-                self.ui_queue.put(("alert", first_alert))
-            if failures:
-                message = f"Test completed: {successes}/{len(endpoints)} OK. " + " | ".join(failures[:2])
-            else:
-                message = f"Test succeeded: {successes}/{len(endpoints)} endpoint{'s' if len(endpoints) != 1 else ''} OK."
-            self.status_text = message
-            if failures:
-                log(message)
-            self.root.after(0, lambda: callback(message))
+                for index, endpoint_cfg in endpoints:
+                    try:
+                        mode = normalize_delivery_mode(
+                            endpoint_cfg.get("delivery_mode"), existing_url=safe_string(endpoint_cfg.get("endpoint"))
+                        )
+                        if mode == DELIVERY_LIVE:
+                            if self.transport_is_authenticated(
+                                index,
+                                endpoint_cfg,
+                                endpoint_poll_seconds(endpoint_cfg, legacy_default_interval),
+                            ):
+                                successes += 1
+                                continue
+                            response = open_sse_response(
+                                endpoint_cfg,
+                                timeout=SSE_TEST_TIMEOUT_SECONDS,
+                                read_timeout=SSE_TEST_TIMEOUT_SECONDS,
+                            )
+                            try:
+                                handshake_ok = False
+                                deadline = time.monotonic() + SSE_TEST_TIMEOUT_SECONDS
+
+                                def enforce_test_deadline() -> None:
+                                    if time.monotonic() > deadline:
+                                        raise ApiError("Authenticated handshake test timed out.")
+
+                                for event in iter_sse_events(response, on_activity=enforce_test_deadline):
+                                    if event.name != "authenticated":
+                                        raise StreamProtocolError(
+                                            f"PBX sent '{event.name}' before the authenticated handshake."
+                                        )
+                                    payload = json.loads(event.data)
+                                    handshake_ok = isinstance(payload, dict) and payload.get("ok") is True
+                                    break
+                                if not handshake_ok:
+                                    raise StreamProtocolError("Authenticated handshake was not received.")
+                            finally:
+                                response.close()
+                        else:
+                            data, _raw_text = fetch_endpoint(
+                                pbx_transport_url(endpoint_cfg, DELIVERY_POLL),
+                                endpoint_auth_headers(endpoint_cfg),
+                                allow_invalid_certificate=bool(endpoint_cfg.get("allow_invalid_certificate", False)),
+                            )
+                            ensure_api_ok(data)
+                        successes += 1
+                    except Exception as exc:
+                        failures.append(f"{endpoint_display_name(index, endpoint_cfg)}: {exc}")
+
+                if failures:
+                    message = f"Test completed: {successes}/{len(endpoints)} OK. " + " | ".join(failures[:2])
+                else:
+                    message = (
+                        f"Test succeeded: {successes}/{len(endpoints)} PBX profile"
+                        f"{'s' if len(endpoints) != 1 else ''} authenticated."
+                    )
+            except Exception as exc:
+                message = f"Connection test failed: {safe_string(exc)}"
+                failures.append(message)
+            finally:
+                self.connection_test_event.clear()
+                self.status_text = message
+                if failures:
+                    log(message)
+                self.ui_queue.put(("test_result", (callback, message)))
 
         threading.Thread(target=worker, name="EndpointTest", daemon=True).start()
 
     def shutdown(self) -> None:
         self.stop_event.set()
         self.wakeup_event.set()
+        with self.worker_lock:
+            for worker in self.workers.values():
+                worker.stop()
+            self.workers.clear()
         self.root.after(50, self.root.destroy)
 
 
 def remove_config_dir() -> None:
     try:
+        delete_all_profile_secrets()
         if CONFIG_DIR.exists():
             shutil.rmtree(CONFIG_DIR)
     except OSError as exc:
@@ -3020,6 +4178,8 @@ def uninstall() -> None:
     remove_start_menu_entries()
     remove_uninstall_entry()
     remove_settings = "--keep-settings" not in sys.argv
+    if remove_settings:
+        delete_all_profile_secrets()
     if getattr(sys, "frozen", False) and is_windows():
         launch_uninstall_cleanup(remove_settings)
     elif remove_settings:

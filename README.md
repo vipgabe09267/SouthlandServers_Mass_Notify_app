@@ -1,6 +1,6 @@
 # SouthlandServers Mass Notification App
 
-**Current version: V1.0.6-Beta**
+**Current version: V1.0.7-Beta**
 
 [![Windows](https://img.shields.io/badge/platform-Windows-0A66C2)](#install)
 [![Python](https://img.shields.io/badge/built%20with-Python-3776AB)](#build-from-source)
@@ -9,7 +9,7 @@
 
 SouthlandServers Mass Notification App is an open-source Windows desktop companion for SIP NOTIFY, emergency alert, PBX announcement, and EAS-style visual notification workflows.
 
-It runs quietly in the background, starts with Windows if enabled, polls one or more endpoints, plays the selected WAV alert tone for new events, and displays clean desktop alert windows without requiring users to keep a browser open.
+It runs quietly in the background, starts with Windows if enabled, maintains authenticated live PBX streams, plays the selected WAV alert tone for new events, and displays clean desktop alert windows without requiring users to keep a browser open. Legacy JSON polling remains available as an explicit compatibility fallback.
 
 [View Southland Servers Projects](https://southlandservers.xyz/projects)
 
@@ -21,8 +21,9 @@ It runs quietly in the background, starts with Windows if enabled, polls one or 
 | --- | --- |
 | Weather alerts | Shows NWS/SIP NOTIFY-style alert screens with title, priority, severity, area, effective time, and until/expires time. |
 | Announcements | Shows a simplified safe-format notice with a hazard icon, title, and body only. |
-| Endpoints | Supports up to three independent HTTP/HTTPS endpoints, with red warnings for non-local HTTP. |
-| Authentication | Supports bearer token, no authentication, or username/password auth per endpoint. |
+| PBX profiles | Supports up to three independent PBX connections with normalized server addresses. |
+| Live delivery | Uses an authenticated SSE handshake, plus deduplicated catch-up checks so PBX stream omissions cannot silently lose targeted messages. |
+| Authentication | Uses desktop-specific HTTP Basic credentials for live mode; legacy modes remain available for migrated polling profiles. |
 | Startup | Can register itself to run automatically when Windows starts. |
 | Audio | Select bundled WAV tones from the `audio` folder, preview them, or import a custom WAV. |
 | Updates | Optional automatic update checks from GitHub Releases on startup and about every 15 minutes. |
@@ -65,7 +66,7 @@ The announcement window intentionally does not display endpoint internals, XML i
 
 ## Install
 
-Download the latest V1.0.6-Beta installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
+Download the latest V1.0.7-Beta installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
 
 ```text
 SLS_Mass_Notify_Installer.exe
@@ -95,47 +96,55 @@ Windows SmartScreen may warn on unsigned builds. Code signing is recommended bef
 
 ## First Run Setup
 
-When Settings opens, configure at least one endpoint.
+When Settings opens, configure at least one PBX profile.
 
-1. Enable the endpoint tab you want to use.
-2. Enter the endpoint URL. HTTPS is recommended.
-3. Choose bearer token, no authentication, or username/password auth.
-4. Review any red HTTP or yellow no-auth security warnings.
-5. Choose the poll interval.
-6. Choose the alert audio tone or import your own `.wav`.
-7. Click `Test Active Endpoints`.
-8. Click `Save`.
+1. Enable the PBX profile you want to use.
+2. Enter the HTTPS PBX hostname or origin URL.
+3. Select `Live handshake (v0.0.7-beta or newer only)` for current PBX releases, or `Legacy polling fallback (v0.0.6-beta or older only)` for older PBXs.
+4. For live handshake, enter the desktop-specific username and password configured in FreePBX. Authentication is fixed to this supported method.
+5. Keep automatic reconnect enabled and certificate validation enabled.
+6. For a legacy profile, choose username/password or bearer-token authentication and set that profile's polling interval.
+7. Choose the alert audio tone or import your own `.wav`.
+8. Click `Test connections`; live tests require the named `authenticated` SSE event.
+9. Click `Save changes`.
 
-The app can monitor up to three endpoints at the same time. Each endpoint can have a different URL, authentication mode, credential set, and enabled state.
+The app can monitor up to three PBXs at the same time. Each profile has its own address, credentials, delivery mode, legacy polling interval, reconnect policy, and enabled state.
 
 ## How It Works
 
-The background app polls each enabled endpoint on a timer.
+The background app gives each enabled PBX its own cancellable transport worker.
 
 ```mermaid
 flowchart LR
     A[Windows Startup] --> B[SLS Mass Notify Background App]
     B --> C[Load Settings]
-    C --> D[Poll Configured Endpoints]
-    D --> E{New latest.id?}
+    C --> D[Open authenticated SSE stream]
+    D --> E{Authenticated event received?}
     E -- No --> D
-    E -- Yes --> F[Play selected WAV once]
-    F --> G{kind}
-    G -- alert --> H[Show Weather Alert Screen]
-    G -- announcement --> I[Show Safe Announcement Notice]
-    D --> J{Fault unresolved 5 min?}
-    J -- Yes --> K[Desktop Fault Notification]
+    E -- Yes --> F[Wait for notification event]
+    F --> G{New event ID?}
+    G -- No --> F
+    G -- Yes --> H[Play selected WAV once]
+    H --> I{kind}
+    I -- alert --> J[Show Weather Alert Screen]
+    I -- announcement --> K[Show Safe Announcement Notice]
+    F --> L{Disconnect or bounded reconnect?}
+    L --> D
+    D --> M{Fault unresolved 5 min?}
+    M -- Yes --> N[Desktop Fault Notification]
 ```
 
-For token-protected endpoints, the app sends a normal HTTPS `GET` request:
+Live profiles send an authenticated streaming request:
 
 ```http
-GET /api/sipnotify?limit=25 HTTP/1.1
+GET /api/sipnotify/desktop/stream HTTP/1.1
 Host: example.com
-Authorization: Bearer TOKENHERE
+Accept: text/event-stream
+Authorization: Basic BASE64_USERNAME_PASSWORD
+Last-Event-ID: MOST_RECENT_ACCEPTED_ID
 ```
 
-If `No authentication` is selected, the app calls the endpoint without the `Authorization` header.
+Legacy-polling profiles may use either bearer-token or username/password authentication. Live delivery always requires the desktop-specific username/password pair and therefore does not show an authentication selector.
 
 For username/password endpoints, the app sends HTTP Basic authentication:
 
@@ -143,7 +152,7 @@ For username/password endpoints, the app sends HTTP Basic authentication:
 Authorization: Basic BASE64_USERNAME_PASSWORD
 ```
 
-The app stores the last seen `latest.id` for each endpoint. A notification appears only when that ID changes. If an endpoint does not provide an ID, the app falls back to a content fingerprint.
+The app persists the most recent accepted event ID plus a bounded recent-ID history. Reconnects send `Last-Event-ID`; authenticated live sessions also perform a short catch-up check because some PBX streams acknowledge the handshake without pushing queued targeted announcements. Streaming, catch-up, and legacy polling paths all deduplicate before sound or display. Legacy records without an ID use a content fingerprint.
 
 ## Expected API Format
 
@@ -202,7 +211,7 @@ The app stores the last seen `latest.id` for each endpoint. A notification appea
 
 ## Custom Audio
 
-V1.0.6-Beta keeps alert sounds in the `audio` folder. The default tone is:
+V1.0.7-Beta keeps alert sounds in the `audio` folder. The default tone is:
 
 ```text
 audio\Announcement.wav
@@ -224,10 +233,10 @@ Only `.wav` files under 25 MB are accepted for custom imports.
 
 ## Security Notes
 
-- Endpoint URLs should use `https://`.
-- Non-local `http://` endpoints are allowed but show a red warning because they may be vulnerable to man-in-the-middle attacks.
+- Live PBX profiles require `https://`.
+- Invalid-certificate and legacy HTTP-media switches are disabled by default and visibly marked unsafe.
 - No-auth endpoints show a yellow caution because requests may not be fully authenticated.
-- Local tokens are encrypted with Windows DPAPI before being saved.
+- PBX passwords and legacy tokens are stored in Windows Credential Manager. DPAPI remains a migration/fallback path.
 - Settings are stored under:
 
   ```text
@@ -309,15 +318,15 @@ dist\SLS_Mass_Notify_Installer.exe
 
 Before publishing a release:
 
-1. Confirm `APP_VERSION` is still `1.0.6-Beta` for this V1.0.6-Beta release.
+1. Confirm `APP_VERSION` is still `1.0.7-Beta` for this V1.0.7-Beta release.
 2. Rebuild with `.\build-installer.ps1 -Clean`.
-3. Test install, Terms acceptance, settings save, endpoint warnings, audio selection/play/import, endpoint test, background startup, alert display, announcement display, uninstall, and update preference.
+3. Test install, Terms acceptance, settings save, live authenticated handshake, targeted and all-desktop delivery, reconnect/resume, explicit JSON fallback, supplied colors, TEST ONLY banner, audio, uninstall, and update preference.
 4. Attach `dist\SLS_Mass_Notify_Installer.exe` to the GitHub Release.
 5. Code sign the app and installer when a signing certificate is available.
 
 ## Project Status
 
-V1.0.6-Beta is suitable for controlled testing, demos, pilots, and small trusted deployments.
+V1.0.7-Beta includes production transport and security hardening. Broad emergency-use deployment still requires environment-specific PBX integration testing and signed release artifacts.
 
 Recommended hardening before broad public production rollout:
 

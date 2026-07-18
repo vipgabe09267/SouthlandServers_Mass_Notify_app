@@ -24,20 +24,21 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 INSTALLER_EXE_NAME = "SLS_Mass_Notify_Uninstall.exe"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.6-Beta"
+APP_VERSION = "1.0.7-Beta"
+CREDENTIAL_TARGET_PREFIX = "SouthlandServers/SLS_Mass_Notify"
 AUDIO_DIR_NAME = "audio"
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 UNINSTALL_REG_PATH = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_SHORT_NAME}"
 
 TERMS_TEXT = """SouthlandServers Mass Notification App Terms of Service
 
-By installing or using this app, you acknowledge that it is a desktop notification client that polls user-configured endpoints and displays returned alert or announcement content.
+By installing or using this app, you acknowledge that it is a desktop notification client that receives alert and announcement content from user-configured PBX connections using an authenticated live stream or an explicit legacy polling fallback.
 
 You are responsible for configuring endpoints, tokens, recipient systems, and server-side alert data accurately. The app does not create weather alerts, verify emergency content, or replace official emergency alerting systems.
 
-Use HTTPS endpoints whenever possible. HTTP endpoints may expose traffic to interception or modification. No-auth endpoints may be appropriate only for trusted internal systems and are not recommended for public networks. Username/password and bearer-token credentials should be kept private.
+Use HTTPS PBX connections. HTTP endpoints may expose traffic to interception or modification. Certificate validation must remain enabled in production. Username/password and legacy bearer-token credentials should be kept private.
 
-The app stores local settings under the current Windows user profile and protects saved tokens/passwords with Windows DPAPI when available. The app may check GitHub Releases for updates if automatic updates are enabled during install or in Settings.
+The app stores local settings under the current Windows user profile and stores saved tokens/passwords in Windows Credential Manager, with DPAPI as a compatibility fallback. The app may check GitHub Releases for updates if automatic updates are enabled during install or in Settings.
 
 This software is provided under the GNU Affero General Public License v3.0 without warranty. You agree to test deployments before operational use and to comply with all applicable laws, policies, and emergency communication requirements."""
 
@@ -124,6 +125,33 @@ def stop_running_app() -> None:
     time.sleep(0.5)
 
 
+def launch_through_user_shell(app_path: Path, *, background: bool = False) -> None:
+    """Launch through the existing Explorer shell so the app does not inherit Setup elevation."""
+    explorer = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "explorer.exe"
+    if not explorer.exists():
+        raise FileNotFoundError("Windows Explorer was not found; start SLS Mass Notify from the Start Menu.")
+    shortcut = Path(tempfile.gettempdir()) / f"{APP_SHORT_NAME}_launch_{os.getpid()}.lnk"
+    create_shortcut(
+        shortcut,
+        app_path,
+        arguments="--background" if background else "",
+        description=APP_DISPLAY_NAME,
+    )
+    try:
+        subprocess.Popen(
+            [str(explorer), str(shortcut)],
+            cwd=str(app_path.parent),
+            close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        time.sleep(0.75)
+    finally:
+        try:
+            shortcut.unlink()
+        except OSError:
+            pass
+
+
 def set_startup_enabled(enabled: bool, app_path: Path) -> None:
     if winreg is None:
         return
@@ -152,6 +180,20 @@ def startup_entry_enabled() -> bool:
         return bool(str(value).strip())
     except OSError:
         return False
+
+
+def saved_startup_preference(default: bool = True) -> bool:
+    """Preserve the user's app preference when a reinstall has no Run entry yet."""
+    if startup_entry_enabled():
+        return True
+    try:
+        if CONFIG_PATH.exists():
+            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and isinstance(loaded.get("startup_enabled"), bool):
+                return loaded["startup_enabled"]
+    except (OSError, json.JSONDecodeError):
+        pass
+    return bool(default)
 
 
 def command_line_value(name: str) -> str:
@@ -356,13 +398,7 @@ def install_app(
 
     if launch:
         emit(progress, "Starting SLS Mass Notify.")
-        launch_args = [str(app_path), "--background"] if launch_background else [str(app_path)]
-        subprocess.Popen(
-            launch_args,
-            cwd=str(install_dir),
-            close_fds=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        launch_through_user_shell(app_path, background=launch_background)
     emit(progress, "Installation completed successfully.")
 
 
@@ -457,6 +493,15 @@ def uninstall_app(
         pass
     emit(progress, "Removing Windows uninstall registry entry.")
     remove_uninstall_registry()
+    if remove_settings:
+        emit(progress, "Removing saved PBX credentials from Windows Credential Manager.")
+        for index in range(3):
+            for kind in ("token", "password"):
+                target = f"{CREDENTIAL_TARGET_PREFIX}/pbx-{index + 1}/{kind}"
+                try:
+                    ctypes.windll.advapi32.CredDeleteW(target, 1, 0)
+                except Exception:
+                    pass
     emit(progress, "Scheduling Program Files cleanup.")
     launch_cleanup(install_dir, remove_settings)
     emit(progress, "Uninstall started. The app files will be removed after this window closes.")
@@ -468,24 +513,30 @@ def configure_modern_style(root: Tk) -> None:
     style = ttk.Style(root)
     if "clam" in style.theme_names():
         style.theme_use("clam")
-    root.configure(bg="#f3f6f7")
-    style.configure(".", background="#f3f6f7", foreground="#152522", font=("Segoe UI", 10))
-    style.configure("Page.TFrame", background="#f3f6f7")
-    style.configure("Card.TFrame", background="#ffffff", borderwidth=1, relief="solid")
-    style.configure("Header.TFrame", background="#173b36")
-    style.configure("Header.TLabel", background="#173b36", foreground="#ffffff", font=("Segoe UI Semibold", 21))
-    style.configure("HeaderHint.TLabel", background="#173b36", foreground="#cde4df", font=("Segoe UI", 10))
-    style.configure("Section.TLabel", background="#ffffff", foreground="#152522", font=("Segoe UI Semibold", 12))
-    style.configure("Hint.TLabel", background="#ffffff", foreground="#60716d", font=("Segoe UI", 9))
-    style.configure("Status.TLabel", background="#ffffff", foreground="#52645f", font=("Segoe UI", 9))
-    style.configure("Card.TCheckbutton", background="#ffffff", foreground="#152522", padding=(0, 3))
-    style.map("Card.TCheckbutton", background=[("active", "#ffffff")])
-    style.configure("TEntry", fieldbackground="#ffffff", bordercolor="#d9e3e0", padding=(8, 6))
-    style.configure("TButton", background="#edf2f1", foreground="#152522", borderwidth=0, padding=(13, 8), font=("Segoe UI Semibold", 9))
-    style.map("TButton", background=[("active", "#e0e9e7"), ("pressed", "#d5e1df")])
-    style.configure("Accent.TButton", background="#087f70", foreground="#ffffff", borderwidth=0, padding=(17, 9), font=("Segoe UI Semibold", 9))
-    style.map("Accent.TButton", background=[("active", "#06695e"), ("pressed", "#05564d")], foreground=[("disabled", "#d8e3e1")])
-    style.configure("Horizontal.TProgressbar", background="#087f70", troughcolor="#dfe8e6", borderwidth=0)
+    page = "#111418"
+    surface = "#181c21"
+    field = "#0f1317"
+    ink = "#f3f4f6"
+    muted = "#a7afb9"
+    border = "#343b44"
+    root.configure(bg=page)
+    style.configure(".", background=page, foreground=ink, font=("Segoe UI", 9))
+    style.configure("Page.TFrame", background=page)
+    style.configure("Card.TFrame", background=surface, borderwidth=1, relief="solid")
+    style.configure("Header.TFrame", background=surface)
+    style.configure("Header.TLabel", background=surface, foreground=ink, font=("Segoe UI Semibold", 16))
+    style.configure("HeaderHint.TLabel", background=surface, foreground=muted, font=("Segoe UI", 9))
+    style.configure("Section.TLabel", background=surface, foreground=ink, font=("Segoe UI Semibold", 10))
+    style.configure("Hint.TLabel", background=surface, foreground=muted, font=("Segoe UI", 9))
+    style.configure("Status.TLabel", background=surface, foreground=muted, font=("Segoe UI", 9))
+    style.configure("Card.TCheckbutton", background=surface, foreground=ink, padding=(0, 2))
+    style.map("Card.TCheckbutton", background=[("active", surface)])
+    style.configure("TEntry", fieldbackground=field, foreground=ink, bordercolor=border, lightcolor=border, darkcolor=border, padding=(7, 5))
+    style.configure("TButton", background="#2a3038", foreground=ink, padding=(12, 6), font=("Segoe UI", 9), bordercolor=border)
+    style.map("TButton", background=[("active", "#343c46"), ("pressed", "#3d4652")], foreground=[("disabled", "#727b86")])
+    style.configure("Accent.TButton", background="#2f81f7", foreground="#ffffff", padding=(14, 6), font=("Segoe UI Semibold", 9))
+    style.map("Accent.TButton", background=[("active", "#388bfd"), ("pressed", "#1f6feb")], foreground=[("disabled", "#89929d")])
+    style.configure("Horizontal.TProgressbar", background="#2f81f7", troughcolor="#252b32", borderwidth=0)
 
 
 class InstallerWindow:
@@ -502,7 +553,7 @@ class InstallerWindow:
                 pass
 
         self.install_dir = StringVar(value=str(DEFAULT_INSTALL_DIR))
-        self.startup = BooleanVar(value=True)
+        self.startup = BooleanVar(value=saved_startup_preference())
         self.launch = BooleanVar(value=True)
         self.auto_update = BooleanVar(value=True)
         self.accept_terms = BooleanVar(value=False)
@@ -517,22 +568,22 @@ class InstallerWindow:
     def _build(self) -> None:
         self.root.columnconfigure(0, weight=1)
 
-        header = ttk.Frame(self.root, padding=(26, 16), style="Header.TFrame")
+        header = ttk.Frame(self.root, padding=(20, 12), style="Header.TFrame")
         header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(header, text="Install SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(header, text="SLS Mass Notify Setup", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text=f"Southland Servers desktop notification client  |  Version {APP_VERSION}",
+            text=f"Version {APP_VERSION}",
             style="HeaderHint.TLabel",
         ).pack(anchor="w", pady=(3, 0))
 
-        frame = ttk.Frame(self.root, padding=(18, 14), style="Page.TFrame")
+        frame = ttk.Frame(self.root, padding=(16, 14), style="Page.TFrame")
         frame.grid(row=1, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
 
-        options = ttk.Frame(frame, padding=16, style="Card.TFrame")
-        options.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        options = ttk.Frame(frame, padding=14, style="Card.TFrame")
+        options.grid(row=0, column=0, columnspan=2, sticky="ew")
         options.columnconfigure(0, weight=1)
         ttk.Label(options, text="Installation", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(options, text="Choose where the app is installed and how it starts.", style="Hint.TLabel").grid(
@@ -556,8 +607,8 @@ class InstallerWindow:
             style="Card.TCheckbutton",
         ).grid(row=6, column=0, columnspan=3, sticky="w")
 
-        terms = ttk.Frame(frame, padding=16, style="Card.TFrame")
-        terms.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        terms = ttk.Frame(frame, padding=14, style="Card.TFrame")
+        terms.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         terms.columnconfigure(0, weight=1)
         ttk.Label(terms, text="Terms of Service", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(terms, text="Review and accept the terms before installation.", style="Hint.TLabel").grid(
@@ -565,18 +616,20 @@ class InstallerWindow:
         )
         terms_box = Text(
             terms,
-            width=50,
-            height=10,
+            width=88,
+            height=6,
             wrap="word",
             state="normal",
             font=("Segoe UI", 9),
-            bg="#f7faf9",
-            fg="#334640",
+            bg="#0f1317",
+            fg="#e6edf3",
+            insertbackground="#e6edf3",
+            selectbackground="#264f78",
             relief="flat",
             padx=10,
             pady=9,
             highlightthickness=1,
-            highlightbackground="#d9e3e0",
+            highlightbackground="#343b44",
         )
         terms_box.insert("1.0", TERMS_TEXT)
         terms_box.configure(state="disabled")
@@ -589,30 +642,14 @@ class InstallerWindow:
             style="Card.TCheckbutton",
         ).grid(row=3, column=0, sticky="w", pady=(9, 0))
 
-        progress = ttk.Frame(frame, padding=14, style="Card.TFrame")
-        progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        progress = ttk.Frame(frame, padding=12, style="Card.TFrame")
+        progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         progress.columnconfigure(0, weight=1)
-        self.progressbar = ttk.Progressbar(progress, mode="indeterminate")
-        self.progressbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 9))
-        self.log_box = Text(
-            progress,
-            width=100,
-            height=3,
-            wrap="word",
-            state="disabled",
-            font=("Consolas", 8),
-            bg="#f7faf9",
-            fg="#3e514c",
-            relief="flat",
-            padx=9,
-            pady=7,
-            highlightthickness=1,
-            highlightbackground="#d9e3e0",
-        )
-        self.log_box.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 12))
-        ttk.Label(progress, textvariable=self.status, style="Status.TLabel").grid(row=2, column=0, sticky="w")
+        self.progressbar = ttk.Progressbar(progress, mode="determinate", value=0, maximum=100)
+        self.progressbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        ttk.Label(progress, textvariable=self.status, style="Status.TLabel").grid(row=1, column=0, sticky="w")
         actions = ttk.Frame(frame, style="Page.TFrame")
-        actions.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        actions.grid(row=3, column=0, columnspan=2, sticky="e", pady=(10, 0))
         self.cancel_button = ttk.Button(actions, text="Cancel", command=self.root.destroy)
         self.cancel_button.pack(side="left", padx=(0, 8))
         self.install_button = ttk.Button(actions, text="Install now", style="Accent.TButton", command=self.install)
@@ -712,16 +749,16 @@ class UninstallerWindow:
 
     def _build(self, auto_start: bool) -> None:
         self.root.columnconfigure(0, weight=1)
-        header = ttk.Frame(self.root, padding=(26, 20), style="Header.TFrame")
+        header = ttk.Frame(self.root, padding=(20, 12), style="Header.TFrame")
         header.grid(row=0, column=0, sticky="ew")
         ttk.Label(header, text="Uninstall SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(header, text="Remove the app and its Windows integration", style="HeaderHint.TLabel").pack(
+        ttk.Label(header, text=f"Version {APP_VERSION}", style="HeaderHint.TLabel").pack(
             anchor="w", pady=(3, 0)
         )
 
-        page = ttk.Frame(self.root, padding=22, style="Page.TFrame")
+        page = ttk.Frame(self.root, padding=16, style="Page.TFrame")
         page.grid(row=1, column=0, sticky="nsew")
-        frame = ttk.Frame(page, padding=18, style="Card.TFrame")
+        frame = ttk.Frame(page, padding=14, style="Card.TFrame")
         frame.grid(row=0, column=0, sticky="nsew")
         ttk.Label(frame, text="Removal options", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(
@@ -732,7 +769,7 @@ class UninstallerWindow:
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 12))
         ttk.Checkbutton(
             frame,
-            text="Remove saved endpoint settings and tokens",
+            text="Remove saved PBX settings and credentials",
             variable=self.remove_settings,
             style="Card.TCheckbutton",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 12))
@@ -746,13 +783,15 @@ class UninstallerWindow:
             wrap="word",
             state="disabled",
             font=("Consolas", 8),
-            bg="#f7faf9",
-            fg="#3e514c",
+            bg="#0f1317",
+            fg="#e6edf3",
+            insertbackground="#e6edf3",
+            selectbackground="#264f78",
             relief="flat",
             padx=9,
             pady=7,
             highlightthickness=1,
-            highlightbackground="#d9e3e0",
+            highlightbackground="#343b44",
         )
         self.log_box.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 14))
         ttk.Label(frame, textvariable=self.status, style="Status.TLabel").grid(row=6, column=0, sticky="w")
@@ -833,7 +872,7 @@ def main() -> None:
         install_dir = Path(requested_install_dir).resolve() if requested_install_dir else DEFAULT_INSTALL_DIR
         install_app(
             install_dir,
-            startup=startup_entry_enabled(),
+            startup=saved_startup_preference(),
             launch=True,
             remove_legacy=True,
             auto_update=None,
