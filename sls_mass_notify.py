@@ -8,11 +8,10 @@ import io
 import json
 import os
 import queue
-import random
 import re
+import secrets
 import shutil
 import socket
-import ssl
 import subprocess
 import sys
 import tempfile
@@ -25,7 +24,7 @@ from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tkinter import BooleanVar, Canvas, IntVar, StringVar, Text, Tk, Toplevel, filedialog, messagebox
+from tkinter import BooleanVar, Canvas, StringVar, Text, Tk, Toplevel, filedialog, messagebox
 from tkinter import ttk
 
 from defusedxml import ElementTree as ET
@@ -53,19 +52,13 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 COMPANY_NAME = "SouthlandServers"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.7-Beta"
+APP_VERSION = "1.0.8-Beta"
 IPC_HOST = "127.0.0.1"
 IPC_PORT = 48572
-DEFAULT_POLL_SECONDS = 10
 MAX_ENDPOINTS = 3
 DELIVERY_LIVE = "live_sse"
-DELIVERY_POLL = "legacy_polling"
-DELIVERY_LABELS = {
-    DELIVERY_LIVE: "Live handshake (v0.0.7-beta or newer only)",
-    DELIVERY_POLL: "Legacy polling fallback (v0.0.6-beta or older only)",
-}
 PBX_LIVE_PATH = "/api/sipnotify/desktop/stream"
-PBX_POLL_PATH = "/api/sipnotify/desktop"
+PBX_RECENT_PATH = "/api/sipnotify/desktop"
 SSE_CONNECT_TIMEOUT_SECONDS = 25
 SSE_TEST_TIMEOUT_SECONDS = 12
 SSE_READ_TIMEOUT_SECONDS = 330
@@ -87,14 +80,7 @@ UPDATE_DOWNLOAD_LIMIT_BYTES = 150 * 1024 * 1024
 AUDIO_DIR_NAME = "audio"
 DEFAULT_AUDIO_NAME = "Announcement.wav"
 MAX_CUSTOM_AUDIO_BYTES = 25 * 1024 * 1024
-AUTH_TOKEN = "token"
-AUTH_NONE = "none"
 AUTH_BASIC = "basic"
-AUTH_LABELS = {
-    AUTH_TOKEN: "Bearer token",
-    AUTH_NONE: "No authentication",
-    AUTH_BASIC: "Username/password",
-}
 GITHUB_OWNER = "vipgabe09267"
 GITHUB_REPO = "SouthlandServers_Mass_Notify_app"
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases?per_page=10"
@@ -604,8 +590,8 @@ def unprotect_secret(value: str) -> str:
             log(f"Windows Credential Manager read failed: {exc}")
             return ""
     if not value.startswith(("dpapi:", "plain:", "cred:")):
-        # Legacy builds stored endpoint tokens as raw text. Return them so the
-        # settings window can save once and migrate them to the current format.
+        # Older builds stored some secrets as raw text. Read once so Settings can
+        # move a password into Windows Credential Manager on the next save.
         return value
     try:
         if value.startswith("dpapi:") and is_windows():
@@ -613,7 +599,7 @@ def unprotect_secret(value: str) -> str:
         if value.startswith("plain:"):
             return base64.b64decode(value.removeprefix("plain:")).decode("utf-8")
     except Exception as exc:
-        log(f"token decrypt failed: {exc}")
+        log(f"secret decrypt failed: {exc}")
     return ""
 
 
@@ -624,12 +610,7 @@ def blank_endpoint(index: int) -> dict:
         "enabled": index == 0,
         "auth_mode": AUTH_BASIC,
         "delivery_mode": DELIVERY_LIVE,
-        "poll_seconds": DEFAULT_POLL_SECONDS,
         "reconnect_automatically": True,
-        "allow_invalid_certificate": False,
-        "allow_legacy_media": False,
-        "no_token": False,
-        "token": "",
         "username": "",
         "password": "",
         "last_event_id": "",
@@ -638,39 +619,9 @@ def blank_endpoint(index: int) -> dict:
     }
 
 
-def normalize_auth_mode(value: object, no_token: bool = False) -> str:
-    mode = normalize_key(value or "")
-    if no_token:
-        return AUTH_NONE
-    if mode in {"none", "noauth", "noauthentication", "notoken"}:
-        return AUTH_NONE
-    if mode in {"basic", "usernamepassword", "userpass", "password"}:
-        return AUTH_BASIC
-    return AUTH_TOKEN
-
-
-def normalize_delivery_mode(value: object, *, existing_url: str = "") -> str:
-    mode = normalize_key(value or "")
-    if mode in {"legacypolling", "polling", "poll", "json", "legacyfallback"}:
-        return DELIVERY_POLL
-    if mode in {"livesse", "live", "sse", "authenticatedhandshake", "liveauthenticatedhandshake"}:
-        return DELIVERY_LIVE
-    # Preserve upgraded 1.0.6 profiles as polling. Newly created profiles are live.
-    return DELIVERY_POLL if safe_string(existing_url) else DELIVERY_LIVE
-
-
-def normalize_poll_seconds(value: object, default: int = DEFAULT_POLL_SECONDS) -> int:
-    try:
-        return max(5, min(3600, int(value)))
-    except (TypeError, ValueError):
-        return max(5, min(3600, int(default)))
-
-
 def normalize_endpoint(value: object, index: int) -> dict:
     endpoint = blank_endpoint(index)
     if isinstance(value, dict):
-        no_token = bool(value.get("no_token", value.get("noToken", False)))
-        auth_mode = normalize_auth_mode(value.get("auth_mode", value.get("authMode", "")), no_token)
         configured_url = safe_string(value.get("endpoint") or value.get("url"))
         recent_ids = value.get("recent_event_ids", value.get("recentEventIds", []))
         if not isinstance(recent_ids, list):
@@ -681,18 +632,9 @@ def normalize_endpoint(value: object, index: int) -> dict:
                 "name": safe_string(value.get("name")) or endpoint["name"],
                 "endpoint": configured_url,
                 "enabled": bool(value.get("enabled", endpoint["enabled"])),
-                "auth_mode": auth_mode,
-                "delivery_mode": normalize_delivery_mode(
-                    value.get("delivery_mode", value.get("deliveryMode", "")), existing_url=configured_url
-                ),
-                "poll_seconds": normalize_poll_seconds(
-                    value.get("poll_seconds", value.get("pollSeconds", DEFAULT_POLL_SECONDS))
-                ),
+                "auth_mode": AUTH_BASIC,
+                "delivery_mode": DELIVERY_LIVE,
                 "reconnect_automatically": bool(value.get("reconnect_automatically", True)),
-                "allow_invalid_certificate": bool(value.get("allow_invalid_certificate", False)),
-                "allow_legacy_media": bool(value.get("allow_legacy_media", False)),
-                "no_token": auth_mode == AUTH_NONE,
-                "token": safe_string(value.get("token")),
                 "username": safe_string(value.get("username", value.get("user", ""))),
                 "password": safe_string(value.get("password")),
                 "last_event_id": safe_string(value.get("last_event_id", value.get("lastEventId", ""))),
@@ -707,28 +649,20 @@ def normalize_endpoint(value: object, index: int) -> dict:
 
 def normalize_endpoints(config: dict) -> list[dict]:
     endpoints: list[dict] = []
-    legacy_interval = normalize_poll_seconds(config.get("poll_seconds", DEFAULT_POLL_SECONDS))
     configured = config.get("endpoints")
     if isinstance(configured, list):
         for index, endpoint in enumerate(configured[:MAX_ENDPOINTS]):
-            normalized = normalize_endpoint(endpoint, index)
-            if isinstance(endpoint, dict) and "poll_seconds" not in endpoint and "pollSeconds" not in endpoint:
-                normalized["poll_seconds"] = legacy_interval
-            endpoints.append(normalized)
+            endpoints.append(normalize_endpoint(endpoint, index))
 
-    if not endpoints and (config.get("endpoint") or config.get("token")):
+    if not endpoints and config.get("endpoint"):
         endpoints.append(
             normalize_endpoint(
                 {
                     "name": "PBX 1",
                     "endpoint": config.get("endpoint", ""),
                     "enabled": True,
-                    "auth_mode": AUTH_NONE if bool(config.get("no_token", False)) else AUTH_TOKEN,
-                    "no_token": bool(config.get("no_token", False)),
-                    "token": config.get("token", ""),
                     "username": config.get("username", ""),
                     "password": config.get("password", ""),
-                    "poll_seconds": legacy_interval,
                     "last_event_id": config.get("last_event_id", ""),
                     "last_fingerprint": config.get("last_fingerprint", ""),
                 },
@@ -750,24 +684,19 @@ def normalize_config(config: dict) -> dict:
     normalized["endpoints"] = normalize_endpoints(normalized)
     first = normalized["endpoints"][0]
     normalized["endpoint"] = first.get("endpoint", "")
-    normalized["token"] = first.get("token", "")
     normalized["username"] = first.get("username", "")
     normalized["password"] = first.get("password", "")
-    normalized["auth_mode"] = normalize_auth_mode(first.get("auth_mode"), bool(first.get("no_token", False)))
-    normalized["no_token"] = bool(first.get("no_token", False))
+    normalized["auth_mode"] = AUTH_BASIC
     normalized["last_event_id"] = first.get("last_event_id", "")
     normalized["last_fingerprint"] = first.get("last_fingerprint", "")
     normalized["audio_sound"] = safe_audio_name(safe_string(normalized.get("audio_sound")) or DEFAULT_AUDIO_NAME)
+    for legacy_key in ("token", "no_token", "poll_seconds"):
+        normalized.pop(legacy_key, None)
     return normalized
 
 
 def endpoint_has_credentials(endpoint: dict) -> bool:
-    auth_mode = normalize_auth_mode(endpoint.get("auth_mode"), bool(endpoint.get("no_token")))
-    if auth_mode == AUTH_NONE:
-        return True
-    if auth_mode == AUTH_BASIC:
-        return bool(safe_string(endpoint.get("username")) and unprotect_secret(endpoint.get("password", "")))
-    return bool(unprotect_secret(endpoint.get("token", "")))
+    return bool(safe_string(endpoint.get("username")) and unprotect_secret(endpoint.get("password", "")))
 
 
 def endpoint_display_name(index: int, endpoint: dict) -> str:
@@ -782,29 +711,9 @@ def endpoint_display_name(index: int, endpoint: dict) -> str:
 
 def endpoint_url_allowed(url: str) -> bool:
     parsed = urlparse(url)
-    if parsed.scheme in {"http", "https"} and parsed.hostname and parsed.username is None and parsed.password is None:
+    if parsed.scheme == "https" and parsed.hostname and parsed.username is None and parsed.password is None:
         return True
     return False
-
-
-def endpoint_security_warnings(url: str, auth_mode: str) -> list[tuple[str, str]]:
-    warnings: list[tuple[str, str]] = []
-    parsed = urlparse(safe_string(url))
-    if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
-        warnings.append(
-            (
-                "red",
-                "Warning: this HTTP endpoint may be vulnerable to man-in-the-middle attacks. Use HTTPS when possible.",
-            )
-        )
-    if normalize_auth_mode(auth_mode) == AUTH_NONE:
-        warnings.append(
-            (
-                "yellow",
-                "Caution: this endpoint is not using a token, so requests may not be fully authenticated.",
-            )
-        )
-    return warnings
 
 
 def normalize_pbx_address(value: object) -> str:
@@ -815,29 +724,31 @@ def normalize_pbx_address(value: object) -> str:
         address = "https://" + address
     parsed = urlparse(address)
     if (
-        parsed.scheme.lower() not in {"http", "https"}
+        parsed.scheme.lower() != "https"
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("PBX address must be an HTTP(S) hostname or URL without credentials, query, or fragment.")
+        raise ValueError("PBX address must be an HTTPS hostname or URL without credentials, query, or fragment.")
     host = parsed.hostname
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    default_port = 443 if parsed.scheme.lower() == "https" else 80
+    default_port = 443
     port = f":{parsed.port}" if parsed.port and parsed.port != default_port else ""
     return f"{parsed.scheme.lower()}://{host}{port}"
 
 
-def pbx_transport_url(endpoint_cfg: dict, delivery_mode: str | None = None) -> str:
+def pbx_live_url(endpoint_cfg: dict) -> str:
     origin = normalize_pbx_address(endpoint_cfg.get("endpoint", ""))
-    mode = delivery_mode or normalize_delivery_mode(
-        endpoint_cfg.get("delivery_mode"), existing_url=safe_string(endpoint_cfg.get("endpoint"))
-    )
-    path = PBX_LIVE_PATH if mode == DELIVERY_LIVE else PBX_POLL_PATH
-    return origin + path + ("?limit=25" if mode == DELIVERY_POLL else "")
+    return origin + PBX_LIVE_PATH
+
+
+def pbx_recent_url(endpoint_cfg: dict) -> str:
+    """Authenticated reconciliation endpoint used only while a live session is established."""
+    origin = normalize_pbx_address(endpoint_cfg.get("endpoint", ""))
+    return origin + PBX_RECENT_PATH + "?limit=25"
 
 
 def audio_search_dirs() -> list[Path]:
@@ -934,14 +845,10 @@ def monitoring_idle_status(config: dict, *, connection_test_running: bool = Fals
             return f"Monitoring is waiting: enter the PBX address for {name}."
         if not endpoint_url_allowed(url):
             return f"Monitoring is waiting: correct the PBX address for {name}."
-        auth_mode = normalize_auth_mode(endpoint.get("auth_mode"), bool(endpoint.get("no_token")))
-        if auth_mode == AUTH_BASIC:
-            if not safe_string(endpoint.get("username")):
-                return f"Monitoring is waiting: enter the desktop username for {name}."
-            if not unprotect_secret(endpoint.get("password", "")):
-                return f"Monitoring is waiting: enter the desktop password for {name}."
-        elif auth_mode == AUTH_TOKEN and not unprotect_secret(endpoint.get("token", "")):
-            return f"Monitoring is waiting: enter the API token for {name}."
+        if not safe_string(endpoint.get("username")):
+            return f"Monitoring is waiting: enter the desktop username for {name}."
+        if not unprotect_secret(endpoint.get("password", "")):
+            return f"Monitoring is waiting: enter the desktop password for {name}."
     return "Starting PBX monitoring..."
 
 
@@ -959,10 +866,7 @@ def default_config() -> dict:
         "last_update_release_name": "",
         "last_update_release_tag": "",
         "pending_update_release_id": "",
-        "no_token": False,
-        "poll_seconds": DEFAULT_POLL_SECONDS,
         "startup_enabled": True,
-        "token": "",
         "username": "",
         "password": "",
         "last_event_id": "",
@@ -985,10 +889,25 @@ def load_config() -> dict:
 
 def save_config(config: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    temp_path = CONFIG_PATH.with_suffix(".tmp")
-    with temp_path.open("w", encoding="utf-8") as fh:
-        json.dump(config, fh, indent=2)
-    temp_path.replace(CONFIG_PATH)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=CONFIG_DIR,
+            prefix="settings_",
+            suffix=".tmp",
+            delete=False,
+            encoding="utf-8",
+        ) as fh:
+            json.dump(config, fh, indent=2)
+            temp_path = Path(fh.name)
+        temp_path.replace(CONFIG_PATH)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def install_self_if_needed() -> None:
@@ -1225,8 +1144,6 @@ class AlertData:
     accent_color: str = ""
     text_color: str = ""
     test_only: bool = False
-    allow_invalid_certificate: bool = False
-    allow_legacy_media: bool = False
 
 
 def safe_hex_color(value: object) -> str:
@@ -1437,11 +1354,8 @@ class SameOriginRedirectHandler(HttpSchemeRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def build_http_opener(*, same_origin: bool = False, allow_invalid_certificate: bool = False):
+def build_http_opener(*, same_origin: bool = False):
     handlers: list[object] = [SameOriginRedirectHandler() if same_origin else HttpSchemeRedirectHandler()]
-    if allow_invalid_certificate:
-        context = ssl._create_unverified_context()  # Explicit, per-profile unsafe testing option.  # nosec B323
-        handlers.append(urllib.request.HTTPSHandler(context=context))
     return urllib.request.build_opener(*handlers)
 
 
@@ -1450,11 +1364,8 @@ def open_http_request(
     timeout: int,
     *,
     same_origin: bool = False,
-    allow_invalid_certificate: bool = False,
 ):
-    opener = build_http_opener(
-        same_origin=same_origin, allow_invalid_certificate=allow_invalid_certificate
-    )
+    opener = build_http_opener(same_origin=same_origin)
     return opener.open(request, timeout=timeout)
 
 
@@ -1471,41 +1382,29 @@ def raise_http_status(exc: urllib.error.HTTPError) -> None:
 
 
 def endpoint_auth_headers(endpoint_cfg: dict) -> dict[str, str]:
-    auth_mode = normalize_auth_mode(endpoint_cfg.get("auth_mode"), bool(endpoint_cfg.get("no_token")))
-    if auth_mode == AUTH_NONE:
+    username = safe_string(endpoint_cfg.get("username"))
+    password = unprotect_secret(endpoint_cfg.get("password", ""))
+    if not username or not password:
         return {}
-    if auth_mode == AUTH_BASIC:
-        username = safe_string(endpoint_cfg.get("username"))
-        password = unprotect_secret(endpoint_cfg.get("password", ""))
-        if not username or not password:
-            return {}
-        raw = f"{username}:{password}".encode("utf-8")
-        return {"Authorization": "Basic " + base64.b64encode(raw).decode("ascii")}
-    token = unprotect_secret(endpoint_cfg.get("token", ""))
-    if token:
-        return {"Authorization": f"Bearer {token}"}
-    return {}
+    raw = f"{username}:{password}".encode("utf-8")
+    return {"Authorization": "Basic " + base64.b64encode(raw).decode("ascii")}
 
 
 def fetch_endpoint(
     endpoint: str,
     auth_headers: dict[str, str] | None = None,
-    *,
-    allow_invalid_certificate: bool = False,
 ) -> tuple[object, str]:
     headers = {
-        "Accept": "application/json, application/xml, text/xml, text/plain, */*",
+        "Accept": "application/json",
         "User-Agent": f"{APP_SHORT_NAME}/{APP_VERSION}",
     }
     headers.update(auth_headers or {})
     request = urllib.request.Request(endpoint, headers=headers, method="GET")
-    opener = build_http_opener(
-        same_origin=True, allow_invalid_certificate=allow_invalid_certificate
-    )
+    opener = build_http_opener(same_origin=True)
     try:
         with opener.open(request, timeout=10) as response:
             content_type = response.headers.get("Content-Type", "")
-            raw_bytes = response.read(1024 * 1024)
+            raw_bytes = response.read(1024 * 1024 + 1)
     except urllib.error.HTTPError as exc:
         raise_http_status(exc)
     except urllib.error.URLError as exc:
@@ -1513,15 +1412,15 @@ def fetch_endpoint(
     except TimeoutError as exc:
         raise ApiError("Request timed out") from exc
 
+    if len(raw_bytes) > 1024 * 1024:
+        raise ApiError("PBX response exceeded the safety limit")
     raw_text = raw_bytes.decode("utf-8", errors="replace")
-    if "json" in content_type.lower() or raw_text.lstrip().startswith(("{", "[")):
-        try:
-            return json.loads(raw_text), raw_text
-        except json.JSONDecodeError:
-            pass
-    if raw_text.lstrip().startswith("<"):
-        return {"xml_payload": raw_text}, raw_text
-    return {"raw": raw_text}, raw_text
+    if "json" not in content_type.lower() and not raw_text.lstrip().startswith(("{", "[")):
+        raise ApiError("PBX reconciliation response was not JSON")
+    try:
+        return json.loads(raw_text), raw_text
+    except json.JSONDecodeError as exc:
+        raise ApiError("PBX returned invalid JSON") from exc
 
 
 @dataclass
@@ -1605,9 +1504,9 @@ def open_sse_response(
     timeout: int = SSE_CONNECT_TIMEOUT_SECONDS,
     read_timeout: int = SSE_READ_TIMEOUT_SECONDS,
 ):
-    if normalize_auth_mode(endpoint_cfg.get("auth_mode"), bool(endpoint_cfg.get("no_token"))) != AUTH_BASIC:
-        raise ApiError("Live authenticated handshake requires desktop username/password authentication.")
-    url = pbx_transport_url(endpoint_cfg, DELIVERY_LIVE)
+    if not endpoint_has_credentials(endpoint_cfg):
+        raise ApiError("Desktop username and password are required.")
+    url = pbx_live_url(endpoint_cfg)
     if urlparse(url).scheme.lower() != "https":
         raise TlsRequiredError("Live authenticated handshake requires HTTPS.")
     headers = {
@@ -1620,10 +1519,7 @@ def open_sse_response(
     if last_event_id:
         headers["Last-Event-ID"] = last_event_id
     request = urllib.request.Request(url, headers=headers, method="GET")
-    opener = build_http_opener(
-        same_origin=True,
-        allow_invalid_certificate=bool(endpoint_cfg.get("allow_invalid_certificate", False)),
-    )
+    opener = build_http_opener(same_origin=True)
     try:
         response = opener.open(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
@@ -1672,18 +1568,15 @@ def resolve_image_url(image_url: str, endpoint: str) -> str:
     return urljoin(endpoint, image_url)
 
 
-def normalize_alert_urls(alert: AlertData, endpoint: str, endpoint_cfg: dict | None = None) -> None:
+def normalize_alert_urls(alert: AlertData, endpoint: str) -> None:
     alert.image_url = resolve_image_url(alert.image_url, endpoint)
     alert.source_endpoint = endpoint
-    endpoint_cfg = endpoint_cfg or {}
-    alert.allow_invalid_certificate = bool(endpoint_cfg.get("allow_invalid_certificate", False))
-    alert.allow_legacy_media = bool(endpoint_cfg.get("allow_legacy_media", False))
     if alert.image_url:
         image_origin = request_origin(alert.image_url)
         source_origin = request_origin(endpoint)
         if image_origin != source_origin:
             alert.image_url = ""
-        elif image_origin[0] != "https" and not alert.allow_legacy_media:
+        elif image_origin[0] != "https":
             alert.image_url = ""
 
 
@@ -1691,19 +1584,15 @@ def fetch_image_bytes(
     image_url: str,
     *,
     source_endpoint: str = "",
-    allow_invalid_certificate: bool = False,
-    allow_legacy_media: bool = False,
 ) -> bytes:
     parsed = urlparse(image_url)
     if (
-        parsed.scheme.lower() not in {"http", "https"}
+        parsed.scheme.lower() != "https"
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
     ):
-        raise ApiError("Alert image URL must be an HTTP(S) URL without embedded credentials")
-    if parsed.scheme.lower() != "https" and not allow_legacy_media:
-        raise ApiError("Insecure alert media was blocked")
+        raise ApiError("Alert image URL must be HTTPS without embedded credentials")
     if source_endpoint and request_origin(image_url) != request_origin(source_endpoint):
         raise ApiError("Cross-origin alert media was blocked")
     request = urllib.request.Request(
@@ -1718,7 +1607,6 @@ def fetch_image_bytes(
         request,
         timeout=8,
         same_origin=True,
-        allow_invalid_certificate=allow_invalid_certificate,
     ) as response:
         data = response.read(IMAGE_FETCH_LIMIT_BYTES + 1)
     if len(data) > IMAGE_FETCH_LIMIT_BYTES:
@@ -1784,7 +1672,6 @@ def fetch_latest_github_release() -> dict:
 def download_update_installer(release: dict) -> Path:
     release_id = safe_string(release.get("id"))
     download_url = safe_string(release.get("download_url"))
-    asset_name = safe_string(release.get("asset_name")) or "SLS_Mass_Notify_Installer.exe"
     if not release_id or not trusted_github_download_url(download_url):
         raise ApiError("Invalid update release metadata")
     UPDATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2248,8 +2135,6 @@ class AlertWindow:
                 image_bytes = fetch_image_bytes(
                     image_url,
                     source_endpoint=self.alert.source_endpoint,
-                    allow_invalid_certificate=self.alert.allow_invalid_certificate,
-                    allow_legacy_media=self.alert.allow_legacy_media,
                 )
             except Exception as exc:
                 log(f"alert image fetch failed: {exc}")
@@ -2613,10 +2498,10 @@ class SettingsWindow:
         header.grid(row=0, column=0, sticky="ew")
         title_block = ttk.Frame(header, style="Header.TFrame")
         title_block.pack(side="left", fill="x", expand=True)
-        ttk.Label(title_block, text="SLS Mass Notify settings", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(title_block, text="SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             title_block,
-            text="Configure PBX connections, notifications, and Windows startup behavior.",
+            text="PBX connections and notification preferences",
             style="HeaderHint.TLabel",
         ).pack(anchor="w", pady=(3, 0))
         header_meta = ttk.Frame(header, style="Header.TFrame")
@@ -2737,10 +2622,10 @@ class SettingsWindow:
         endpoint_heading = ttk.Frame(endpoints_frame, style="Panel.TFrame")
         endpoint_heading.pack(fill="x")
         ttk.Label(endpoint_heading, text="PBX connections", style="Section.TLabel").pack(side="left", anchor="w")
-        ttk.Label(endpoint_heading, text="Three profiles available", style="Hint.TLabel").pack(side="right", anchor="e")
+        ttk.Label(endpoint_heading, text="Up to three connections", style="Hint.TLabel").pack(side="right", anchor="e")
         ttk.Label(
             endpoints_frame,
-            text="Live profiles use an authenticated stream. Secrets are stored in Windows Credential Manager.",
+            text="Passwords are stored securely for your Windows account.",
             style="Hint.TLabel",
             wraplength=680,
         ).pack(anchor="w", pady=(3, 14))
@@ -2787,162 +2672,75 @@ class SettingsWindow:
 
 
     def _build_endpoint_tab(self, parent: ttk.Frame, index: int, endpoint: dict) -> None:
-        auth_mode = normalize_auth_mode(endpoint.get("auth_mode"), bool(endpoint.get("no_token")))
-        delivery_mode = normalize_delivery_mode(
-            endpoint.get("delivery_mode"), existing_url=safe_string(endpoint.get("endpoint"))
-        )
         form = {
             "name": StringVar(value=safe_string(endpoint.get("name")) or f"PBX {index + 1}"),
             "endpoint": StringVar(value=safe_string(endpoint.get("endpoint"))),
-            "token": StringVar(value=unprotect_secret(safe_string(endpoint.get("token")))),
             "username": StringVar(value=safe_string(endpoint.get("username"))),
             "password": StringVar(value=unprotect_secret(safe_string(endpoint.get("password")))),
-            "auth_mode": StringVar(value=AUTH_LABELS.get(auth_mode, AUTH_LABELS[AUTH_TOKEN])),
-            "delivery_mode": StringVar(value=DELIVERY_LABELS[delivery_mode]),
-            "poll_seconds": IntVar(value=normalize_poll_seconds(endpoint.get("poll_seconds"))),
             "enabled": BooleanVar(value=bool(endpoint.get("enabled", index == 0))),
             "reconnect_automatically": BooleanVar(value=bool(endpoint.get("reconnect_automatically", True))),
-            "allow_invalid_certificate": BooleanVar(value=bool(endpoint.get("allow_invalid_certificate", False))),
-            "allow_legacy_media": BooleanVar(value=bool(endpoint.get("allow_legacy_media", False))),
-            "show_token": BooleanVar(value=False),
-            "token_entry": None,
-            "username_entry": None,
+            "show_password": BooleanVar(value=False),
             "password_entry": None,
-            "token_widgets": [],
-            "basic_widgets": [],
-            "show_secrets_widget": None,
-            "auth_hint_label": None,
             "warning_label": None,
-            "auth_combo": None,
-            "legacy_settings_frame": None,
         }
         self.endpoint_forms.append(form)
 
-        ttk.Label(parent, text=f"PBX profile {index + 1}", style="Field.TLabel", font=("Segoe UI Semibold", 11)).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
-        )
-        ttk.Checkbutton(parent, text="Enabled", variable=form["enabled"], style="Inset.TCheckbutton").grid(
-            row=1, column=0, sticky="w"
-        )
-        delivery_combo = ttk.Combobox(
+        ttk.Label(
             parent,
-            textvariable=form["delivery_mode"],
-            values=list(DELIVERY_LABELS.values()),
-            state="readonly",
-            width=59,
+            text=f"PBX {index + 1}",
+            style="Field.TLabel",
+            font=("Segoe UI Semibold", 11),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Checkbutton(parent, text="Enabled", variable=form["enabled"], style="Inset.TCheckbutton").grid(
+            row=0, column=3, sticky="e"
         )
-        delivery_combo.grid(row=1, column=1, columnspan=3, sticky="ew", padx=(12, 0))
-        delivery_combo.bind("<<ComboboxSelected>>", lambda _event, idx=index: self.update_delivery_mode(idx))
 
-        ttk.Label(parent, text="Display name", style="Field.TLabel").grid(row=2, column=0, sticky="w", pady=(14, 0))
+        ttk.Label(parent, text="Name", style="Field.TLabel").grid(row=1, column=0, sticky="w")
         ttk.Label(parent, text="PBX address", style="Field.TLabel").grid(
-            row=2, column=1, columnspan=3, sticky="w", pady=(14, 0)
+            row=1, column=1, columnspan=3, sticky="w"
         )
         ttk.Entry(parent, textvariable=form["name"], width=24).grid(
-            row=3, column=0, sticky="ew", pady=(4, 0), padx=(0, 10)
+            row=2, column=0, sticky="ew", pady=(4, 0), padx=(0, 10)
         )
         ttk.Entry(parent, textvariable=form["endpoint"], width=64).grid(
-            row=3, column=1, columnspan=3, sticky="ew", pady=(4, 0)
+            row=2, column=1, columnspan=3, sticky="ew", pady=(4, 0)
         )
-
-        legacy_settings = ttk.Frame(parent, style="Inset.TFrame")
-        legacy_settings.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(14, 0))
-        form["legacy_settings_frame"] = legacy_settings
-        ttk.Label(legacy_settings, text="Legacy authentication", style="Field.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        auth_combo = ttk.Combobox(
-            legacy_settings,
-            textvariable=form["auth_mode"],
-            values=[AUTH_LABELS[AUTH_BASIC], AUTH_LABELS[AUTH_TOKEN]],
-            state="readonly",
-            width=22,
-        )
-        auth_combo.grid(row=1, column=0, sticky="w", pady=(4, 0), padx=(0, 24))
-        auth_combo.bind("<<ComboboxSelected>>", lambda _event, idx=index: self.update_auth_mode(idx))
-        form["auth_combo"] = auth_combo
-        ttk.Label(legacy_settings, text="Polling interval", style="Field.TLabel").grid(
-            row=0, column=1, columnspan=2, sticky="w"
-        )
-        ttk.Spinbox(
-            legacy_settings,
-            from_=5,
-            to=3600,
-            textvariable=form["poll_seconds"],
-            width=8,
-        ).grid(row=1, column=1, sticky="w", pady=(4, 0))
-        ttk.Label(legacy_settings, text="seconds", style="Field.TLabel").grid(
-            row=1, column=2, sticky="w", padx=(8, 0), pady=(4, 0)
-        )
-        show_secrets = ttk.Checkbutton(
-            parent,
-            text="Show secrets",
-            variable=form["show_token"],
-            command=lambda idx=index: self.toggle_token(idx),
-            style="Inset.TCheckbutton",
-        )
-        show_secrets.grid(row=5, column=3, sticky="e", padx=(18, 0), pady=(14, 0))
-        form["show_secrets_widget"] = show_secrets
-
-        token_label = ttk.Label(parent, text="Bearer token", style="Field.TLabel")
-        token_label.grid(row=6, column=0, columnspan=4, sticky="w", pady=(5, 0))
-        token_entry = ttk.Entry(parent, textvariable=form["token"], width=80, show="*")
-        token_entry.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(4, 0))
-        form["token_entry"] = token_entry
-        form["token_widgets"] = [token_label, token_entry]
 
         username_label = ttk.Label(parent, text="Username", style="Field.TLabel")
-        username_label.grid(row=6, column=0, sticky="w", pady=(5, 0))
+        username_label.grid(row=3, column=0, sticky="w", pady=(14, 0))
         username_entry = ttk.Entry(parent, textvariable=form["username"], width=28)
-        username_entry.grid(row=7, column=0, sticky="ew", pady=(4, 0), padx=(0, 10))
-        form["username_entry"] = username_entry
+        username_entry.grid(row=4, column=0, sticky="ew", pady=(4, 0), padx=(0, 10))
         password_label = ttk.Label(parent, text="Password", style="Field.TLabel")
-        password_label.grid(row=6, column=1, sticky="w", pady=(5, 0))
+        password_label.grid(row=3, column=1, sticky="w", pady=(14, 0))
         password_entry = ttk.Entry(parent, textvariable=form["password"], width=36, show="*")
-        password_entry.grid(row=7, column=1, columnspan=3, sticky="ew", pady=(4, 0))
+        password_entry.grid(row=4, column=1, columnspan=3, sticky="ew", pady=(4, 0))
         form["password_entry"] = password_entry
-        form["basic_widgets"] = [username_label, username_entry, password_label, password_entry]
+
         options = ttk.Frame(parent, style="Inset.TFrame")
-        options.grid(row=8, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        options.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(12, 0))
         ttk.Checkbutton(
             options,
             text="Reconnect automatically",
             variable=form["reconnect_automatically"],
             style="Inset.TCheckbutton",
-        ).grid(row=0, column=0, sticky="w", padx=(0, 16))
+        ).pack(side="left")
         ttk.Checkbutton(
             options,
-            text="Allow invalid certificate (unsafe)",
-            variable=form["allow_invalid_certificate"],
+            text="Show password",
+            variable=form["show_password"],
             style="Inset.TCheckbutton",
-            command=lambda idx=index: self.update_endpoint_warning(idx),
-        ).grid(row=0, column=1, sticky="w")
-        ttk.Checkbutton(
-            options,
-            text="Allow legacy HTTP media (unsafe)",
-            variable=form["allow_legacy_media"],
-            style="Inset.TCheckbutton",
-            command=lambda idx=index: self.update_endpoint_warning(idx),
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        auth_hint = ttk.Label(
-            parent,
-            text="Bearer token uses Authorization: Bearer. Username/password uses HTTP Basic auth. No authentication sends no Authorization header.",
-            style="InsetHint.TLabel",
-            wraplength=820,
-        )
-        auth_hint.grid(row=9, column=0, columnspan=4, sticky="w", pady=(10, 0))
-        form["auth_hint_label"] = auth_hint
+            command=lambda idx=index: self.toggle_password(idx),
+        ).pack(side="right")
+
         warning_label = ttk.Label(parent, text="", style="InsetHint.TLabel", wraplength=820)
-        warning_label.grid(row=10, column=0, columnspan=4, sticky="w", pady=(7, 0))
+        warning_label.grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
         form["warning_label"] = warning_label
         parent.columnconfigure(0, weight=1)
         parent.columnconfigure(1, weight=1)
         parent.columnconfigure(2, weight=0)
         parent.columnconfigure(3, weight=0)
         form["endpoint"].trace_add("write", lambda *_args, idx=index: self.update_endpoint_warning(idx))
-        form["auth_mode"].trace_add("write", lambda *_args, idx=index: self.update_auth_mode(idx))
-        form["delivery_mode"].trace_add("write", lambda *_args, idx=index: self.update_delivery_mode(idx))
-        self.update_delivery_mode(index)
+        self.update_endpoint_warning(index)
 
     def show_endpoint(self, index: int) -> None:
         if not 0 <= index < len(self.endpoint_panels):
@@ -3001,104 +2799,25 @@ class SettingsWindow:
         label = form.get("warning_label")
         if label is None:
             return
-        auth_mode = self.form_auth_mode(form)
         address = form["endpoint"].get().strip()
-        try:
-            normalized_address = normalize_pbx_address(address) if address else ""
-        except ValueError:
-            normalized_address = address
-        warnings = endpoint_security_warnings(normalized_address, auth_mode)
-        if bool(form["allow_invalid_certificate"].get()):
-            warnings.append(("red", "Unsafe: TLS certificate and hostname validation is disabled for this PBX."))
-        if bool(form["allow_legacy_media"].get()):
-            warnings.append(("red", "Unsafe: unencrypted HTTP alert media is allowed for this PBX."))
-        if not warnings:
-            label.configure(text="Security status: PBX and authentication settings look normal.", style="InsetHint.TLabel")
+        if not address:
+            label.configure(text="HTTPS · certificate validation on", style="InsetHint.TLabel")
             return
-        severity, _message = warnings[0]
-        text = "\n".join(message for _severity, message in warnings)
-        label.configure(text=text, style="RedWarning.TLabel" if severity == "red" else "YellowWarning.TLabel")
+        try:
+            normalize_pbx_address(address)
+        except ValueError as exc:
+            label.configure(text=safe_string(exc), style="RedWarning.TLabel")
+            return
+        label.configure(text="HTTPS · certificate validation on", style="InsetHint.TLabel")
 
-    def form_auth_mode(self, form: dict) -> str:
-        selected = form["auth_mode"].get()
-        for mode, label in AUTH_LABELS.items():
-            if selected == label:
-                return mode
-        return AUTH_TOKEN
-
-    def form_delivery_mode(self, form: dict) -> str:
-        selected = form["delivery_mode"].get()
-        for mode, label in DELIVERY_LABELS.items():
-            if selected == label:
-                return mode
-        return DELIVERY_LIVE
-
-    def update_delivery_mode(self, index: int) -> None:
+    def toggle_password(self, index: int) -> None:
         form = self.endpoint_forms[index]
-        live = self.form_delivery_mode(form) == DELIVERY_LIVE
-        legacy_settings = form.get("legacy_settings_frame")
-        auth_combo = form.get("auth_combo")
-        if live:
-            form["auth_mode"].set(AUTH_LABELS[AUTH_BASIC])
-            if legacy_settings is not None:
-                legacy_settings.grid_remove()
-        else:
-            if self.form_auth_mode(form) not in {AUTH_BASIC, AUTH_TOKEN}:
-                form["auth_mode"].set(AUTH_LABELS[AUTH_BASIC])
-            if legacy_settings is not None:
-                legacy_settings.grid()
-            if auth_combo is not None:
-                auth_combo.configure(state="readonly")
-        self.update_auth_mode(index)
-
-    def toggle_token(self, index: int) -> None:
-        form = self.endpoint_forms[index]
-        show = "" if form["show_token"].get() else "*"
-        for key in ("token_entry", "password_entry"):
-            entry = form.get(key)
-            if entry is not None:
-                entry.configure(show=show)
-
-    def update_auth_mode(self, index: int) -> None:
-        form = self.endpoint_forms[index]
-        mode = self.form_auth_mode(form)
-        for widget in form.get("token_widgets", []):
-            if mode == AUTH_TOKEN:
-                widget.grid()
-            else:
-                widget.grid_remove()
-        for widget in form.get("basic_widgets", []):
-            if mode == AUTH_BASIC:
-                widget.grid()
-            else:
-                widget.grid_remove()
-        show_secrets = form.get("show_secrets_widget")
-        if show_secrets is not None:
-            if mode == AUTH_NONE:
-                show_secrets.grid_remove()
-            else:
-                show_secrets.grid()
-        auth_hint = form.get("auth_hint_label")
-        if auth_hint is not None:
-            hints = {
-                AUTH_TOKEN: "The token is sent as an Authorization: Bearer header and stored in Windows Credential Manager.",
-                AUTH_BASIC: "Desktop-specific credentials use HTTP Basic over HTTPS and are stored in Windows Credential Manager.",
-                AUTH_NONE: "No Authorization header will be sent. Use this only for a trusted endpoint designed for anonymous access.",
-            }
-            auth_hint.configure(text=hints[mode])
-            if self.form_delivery_mode(form) == DELIVERY_LIVE:
-                auth_hint.configure(
-                    text="Live mode uses desktop-specific Basic credentials, waits for the authenticated SSE event, and resumes with Last-Event-ID."
-                )
-        for key in ("token_entry", "username_entry", "password_entry"):
-            entry = form.get(key)
-            if entry is not None:
-                entry.configure(state="normal")
-        self.update_endpoint_warning(index)
+        entry = form.get("password_entry")
+        if entry is not None:
+            entry.configure(show="" if form["show_password"].get() else "*")
 
     def collect_settings(self) -> list[dict] | None:
         endpoints: list[dict] = []
-        security_messages: list[str] = []
         active_count = 0
         for index, form in enumerate(self.endpoint_forms):
             name = form["name"].get().strip() or f"PBX {index + 1}"
@@ -3108,79 +2827,35 @@ class SettingsWindow:
             except ValueError as exc:
                 messagebox.showerror("PBX address", f"PBX profile {index + 1}: {exc}")
                 return None
-            token = form["token"].get().strip()
             username = form["username"].get().strip()
             password = form["password"].get().strip()
-            auth_mode = self.form_auth_mode(form)
-            delivery_mode = self.form_delivery_mode(form)
-            if delivery_mode == DELIVERY_LIVE:
-                auth_mode = AUTH_BASIC
-            try:
-                endpoint_interval = normalize_poll_seconds(form["poll_seconds"].get())
-            except Exception:
-                endpoint_interval = DEFAULT_POLL_SECONDS
-            no_token = auth_mode == AUTH_NONE
             endpoint_enabled = bool(form["enabled"].get())
 
             if url and not endpoint_url_allowed(url):
                 messagebox.showerror(
                     "PBX address",
-                    f"PBX profile {index + 1} must be a valid http:// or https:// hostname or URL.",
+                    f"PBX {index + 1} must use a valid HTTPS hostname or URL.",
                 )
                 return None
             if endpoint_enabled and url:
-                if delivery_mode == DELIVERY_LIVE and urlparse(url).scheme.lower() != "https":
-                    messagebox.showerror(
-                        "HTTPS required",
-                        f"PBX profile {index + 1} must use HTTPS for the live authenticated handshake.",
-                    )
-                    return None
-                if auth_mode == AUTH_TOKEN and not token:
-                    messagebox.showerror(
-                        "Token required",
-                        f"Endpoint {index + 1} needs a bearer token, or choose a different authentication mode.",
-                    )
-                    return None
-                if auth_mode == AUTH_BASIC and (not username or not password):
+                if not username or not password:
                     messagebox.showerror(
                         "Username/password required",
-                        f"Endpoint {index + 1} needs both a username and password for username/password auth.",
+                        f"PBX {index + 1} needs both a desktop username and password.",
                     )
                     return None
-                for _severity, warning in endpoint_security_warnings(url, auth_mode):
-                    security_messages.append(f"Endpoint {index + 1}: {warning}")
-                if bool(form["allow_invalid_certificate"].get()):
-                    security_messages.append(
-                        f"PBX profile {index + 1}: TLS certificate and hostname validation will be disabled."
-                    )
-                if bool(form["allow_legacy_media"].get()):
-                    security_messages.append(
-                        f"PBX profile {index + 1}: unencrypted HTTP alert media will be allowed."
-                    )
                 active_count += 1
-
-            stored_token = ""
-            stored_password = ""
-            if auth_mode == AUTH_TOKEN:
-                stored_token = token
-            elif auth_mode == AUTH_BASIC:
-                stored_password = password
 
             endpoints.append(
                 {
                     "name": name,
                     "endpoint": url,
                     "enabled": endpoint_enabled,
-                    "auth_mode": auth_mode,
-                    "delivery_mode": delivery_mode,
-                    "poll_seconds": endpoint_interval,
+                    "auth_mode": AUTH_BASIC,
+                    "delivery_mode": DELIVERY_LIVE,
                     "reconnect_automatically": bool(form["reconnect_automatically"].get()),
-                    "allow_invalid_certificate": bool(form["allow_invalid_certificate"].get()),
-                    "allow_legacy_media": bool(form["allow_legacy_media"].get()),
-                    "no_token": no_token,
-                    "token": stored_token,
-                    "username": username if auth_mode == AUTH_BASIC else "",
-                    "password": stored_password,
+                    "username": username,
+                    "password": password,
                     "last_event_id": self.app.get_endpoint_state(index, "last_event_id"),
                     "last_fingerprint": self.app.get_endpoint_state(index, "last_fingerprint"),
                     "recent_event_ids": normalize_endpoint(
@@ -3192,30 +2867,11 @@ class SettingsWindow:
         if self.enabled_var.get() and active_count == 0:
             messagebox.showerror("No active endpoint", "Enable and configure at least one endpoint, or disable monitoring.")
             return None
-        if security_messages and not messagebox.askyesno(
-            "Endpoint Security Warnings",
-            "Review these endpoint security warnings before saving:\n\n"
-            + "\n\n".join(security_messages)
-            + "\n\nSave these settings anyway?",
-        ):
-            return None
         for index, endpoint in enumerate(endpoints):
-            auth_mode = normalize_auth_mode(endpoint.get("auth_mode"), bool(endpoint.get("no_token")))
-            if auth_mode == AUTH_TOKEN:
-                endpoint["token"] = protect_profile_secret(index, "token", safe_string(endpoint.get("token")))
-                endpoint["password"] = ""
-                delete_profile_secret(index, "password")
-            elif auth_mode == AUTH_BASIC:
-                endpoint["password"] = protect_profile_secret(
-                    index, "password", safe_string(endpoint.get("password"))
-                )
-                endpoint["token"] = ""
-                delete_profile_secret(index, "token")
-            else:
-                endpoint["token"] = ""
-                endpoint["password"] = ""
-                delete_profile_secret(index, "token")
-                delete_profile_secret(index, "password")
+            endpoint["password"] = protect_profile_secret(
+                index, "password", safe_string(endpoint.get("password"))
+            )
+            delete_profile_secret(index, "token")
         return endpoints
 
     def save(self) -> bool:
@@ -3263,38 +2919,21 @@ class SettingsWindow:
         self.app.shutdown()
 
 
-def endpoint_poll_seconds(endpoint_cfg: dict, fallback: int = DEFAULT_POLL_SECONDS) -> int:
-    return normalize_poll_seconds(endpoint_cfg.get("poll_seconds", fallback), fallback)
-
-
-def endpoint_worker_signature(endpoint_cfg: dict, poll_seconds: int | None = None) -> str:
+def endpoint_worker_signature(endpoint_cfg: dict) -> str:
     keys = (
         "endpoint",
         "enabled",
-        "auth_mode",
-        "token",
         "username",
         "password",
-        "delivery_mode",
         "reconnect_automatically",
-        "allow_invalid_certificate",
-        "allow_legacy_media",
     )
     selected = {key: endpoint_cfg.get(key) for key in keys}
-    selected["poll_seconds"] = endpoint_poll_seconds(
-        endpoint_cfg, DEFAULT_POLL_SECONDS if poll_seconds is None else poll_seconds
-    )
     return json.dumps(selected, sort_keys=True, separators=(",", ":"))
 
 
 def notification_routed_to_client(payload: object, endpoint_cfg: dict) -> bool:
     if not isinstance(payload, dict):
         return False
-    auth_mode = normalize_auth_mode(endpoint_cfg.get("auth_mode"), bool(endpoint_cfg.get("no_token")))
-    # Preserve compatibility for pre-handshake bearer/anonymous sources. Desktop Basic profiles
-    # use the PBX routing contract as a defense-in-depth boundary.
-    if auth_mode != AUTH_BASIC:
-        return True
     if payload.get("desktop_all") is True:
         return True
     username = safe_string(endpoint_cfg.get("username"))
@@ -3306,7 +2945,7 @@ def notification_routed_to_client(payload: object, endpoint_cfg: dict) -> bool:
     return False
 
 
-def polling_records(data: object, last_event_id: str) -> list[dict]:
+def reconciliation_records(data: object, last_event_id: str) -> list[dict]:
     if not isinstance(data, dict):
         return []
     latest = data.get("latest")
@@ -3335,12 +2974,11 @@ def polling_records(data: object, last_event_id: str) -> list[dict]:
 
 
 class EndpointTransportWorker:
-    def __init__(self, app: "MassNotifyApp", index: int, endpoint_cfg: dict, poll_seconds: int) -> None:
+    def __init__(self, app: "MassNotifyApp", index: int, endpoint_cfg: dict) -> None:
         self.app = app
         self.index = index
         self.endpoint_cfg = normalize_endpoint(endpoint_cfg, index)
-        self.poll_seconds = max(5, int(poll_seconds))
-        self.signature = endpoint_worker_signature(self.endpoint_cfg, self.poll_seconds)
+        self.signature = endpoint_worker_signature(self.endpoint_cfg)
         self.stop_event = threading.Event()
         self.response_lock = threading.Lock()
         self.response = None
@@ -3357,16 +2995,12 @@ class EndpointTransportWorker:
         )
 
     def start(self) -> None:
-        mode = normalize_delivery_mode(
-            self.endpoint_cfg.get("delivery_mode"), existing_url=safe_string(self.endpoint_cfg.get("endpoint"))
+        self.catchup_thread = threading.Thread(
+            target=self._run_live_catchup,
+            name=f"PBXLiveCatchup-{self.index + 1}",
+            daemon=True,
         )
-        if mode == DELIVERY_LIVE:
-            self.catchup_thread = threading.Thread(
-                target=self._run_live_catchup,
-                name=f"PBXLiveCatchup-{self.index + 1}",
-                daemon=True,
-            )
-            self.catchup_thread.start()
+        self.catchup_thread.start()
         self.thread.start()
 
     def stop(self) -> None:
@@ -3403,67 +3037,7 @@ class EndpointTransportWorker:
         log(message)
 
     def run(self) -> None:
-        mode = normalize_delivery_mode(
-            self.endpoint_cfg.get("delivery_mode"), existing_url=safe_string(self.endpoint_cfg.get("endpoint"))
-        )
-        if mode == DELIVERY_LIVE:
-            self._run_live()
-        else:
-            self._run_polling()
-
-    def _run_polling(self) -> None:
-        name = endpoint_display_name(self.index, self.endpoint_cfg)
-        while not self.stop_event.is_set():
-            self._status("CONNECTING", f"{name}: checking legacy JSON fallback")
-            try:
-                url = pbx_transport_url(self.endpoint_cfg, DELIVERY_POLL)
-                data, raw_text = fetch_endpoint(
-                    url,
-                    endpoint_auth_headers(self.endpoint_cfg),
-                    allow_invalid_certificate=bool(self.endpoint_cfg.get("allow_invalid_certificate", False)),
-                )
-                ensure_api_ok(data)
-                last_id = self.app.get_endpoint_state(self.index, "last_event_id")
-                for record in polling_records(data, last_id):
-                    self._accept_payload(record, json.dumps(record, ensure_ascii=False))
-                self.app.clear_fault(f"endpoint-{self.index}")
-                self._status(
-                    "POLLING",
-                    f"{name}: legacy polling OK at {datetime.now().strftime('%H:%M:%S')}",
-                )
-            except UnauthorizedError as exc:
-                if self.stop_event.is_set():
-                    return
-                message = f"{name}: {exc}"
-                self._status("AUTH_FAILED", message)
-                self._fault(message)
-                self.stop_event.wait()
-                return
-            except TlsRequiredError as exc:
-                if self.stop_event.is_set():
-                    return
-                message = f"{name}: {exc}"
-                self._status("TLS_REQUIRED", message)
-                self._fault(message)
-                self.stop_event.wait()
-                return
-            except RateLimitedError as exc:
-                if self.stop_event.is_set():
-                    return
-                message = f"{name}: {exc}"
-                self._status("RATE_LIMITED", message)
-                self._fault(message)
-                if self.stop_event.wait(60):
-                    return
-                continue
-            except Exception as exc:
-                if self.stop_event.is_set():
-                    return
-                message = f"{name}: polling failed: {safe_string(exc)}"
-                self._status("RECONNECTING", message)
-                self._fault(message)
-            if self.stop_event.wait(self.poll_seconds):
-                return
+        self._run_live()
 
     def _run_live(self) -> None:
         name = endpoint_display_name(self.index, self.endpoint_cfg)
@@ -3490,7 +3064,7 @@ class EndpointTransportWorker:
                     self._status("DISCONNECTED", f"{name}: live stream closed; automatic reconnect is off")
                     self.stop_event.wait()
                     return
-                delay = random.uniform(0.1, 0.8) if reconnect_requested else self.server_retry_seconds
+                delay = secrets.SystemRandom().uniform(0.1, 0.8) if reconnect_requested else self.server_retry_seconds
                 self._status("RECONNECTING", f"{name}: renewing live stream")
                 if self.stop_event.wait(delay):
                     return
@@ -3534,7 +3108,7 @@ class EndpointTransportWorker:
                     return
                 delay = RECONNECT_BACKOFF_SECONDS[min(backoff_index, len(RECONNECT_BACKOFF_SECONDS) - 1)]
                 backoff_index = min(backoff_index + 1, len(RECONNECT_BACKOFF_SECONDS) - 1)
-                delay = min(30.0, delay + random.uniform(0.0, max(0.25, delay * 0.2)))
+                delay = min(30.0, delay + secrets.SystemRandom().uniform(0.0, max(0.25, delay * 0.2)))
                 self._status("RECONNECTING", f"{message}; retrying in {delay:.1f}s")
                 if self.stop_event.wait(delay):
                     return
@@ -3567,14 +3141,13 @@ class EndpointTransportWorker:
 
     def _live_catchup_once(self) -> int:
         data, raw_text = fetch_endpoint(
-            pbx_transport_url(self.endpoint_cfg, DELIVERY_POLL),
+            pbx_recent_url(self.endpoint_cfg),
             endpoint_auth_headers(self.endpoint_cfg),
-            allow_invalid_certificate=bool(self.endpoint_cfg.get("allow_invalid_certificate", False)),
         )
         ensure_api_ok(data)
         last_id = self.app.get_endpoint_state(self.index, "last_event_id")
         accepted = 0
-        for record in polling_records(data, last_id):
+        for record in reconciliation_records(data, last_id):
             if self._accept_payload(
                 record,
                 json.dumps(record, ensure_ascii=False) if isinstance(record, dict) else raw_text,
@@ -3612,11 +3185,10 @@ class EndpointTransportWorker:
                 self.session_id = bounded_text(payload.get("session_id"), 160)
                 self.client_id = bounded_text(payload.get("client_id"), 160)
                 self.app.clear_fault(f"endpoint-{self.index}")
-                unsafe = " (certificate validation disabled)" if self.endpoint_cfg.get("allow_invalid_certificate") else ""
                 log(f"{endpoint_display_name(self.index, self.endpoint_cfg)} live handshake authenticated")
                 self._status(
                     "AUTHENTICATED",
-                    f"{endpoint_display_name(self.index, self.endpoint_cfg)}: live authenticated{unsafe}",
+                    f"{endpoint_display_name(self.index, self.endpoint_cfg)}: connected",
                 )
                 continue
             if not authenticated:
@@ -3638,7 +3210,7 @@ class EndpointTransportWorker:
         raw_text: str,
         stream_event_id: str = "",
         *,
-        delivery_source: str = "legacy polling",
+        delivery_source: str = "live reconciliation",
     ) -> bool:
         if not notification_routed_to_client(payload, self.endpoint_cfg):
             event_id = safe_string(lookup(payload, EVENT_ID_KEYS)) if isinstance(payload, dict) else ""
@@ -3650,7 +3222,7 @@ class EndpointTransportWorker:
         alert = extract_alert(payload, raw_text)
         if stream_event_id:
             alert.event_id = stream_event_id
-        normalize_alert_urls(alert, safe_string(self.endpoint_cfg.get("endpoint")), self.endpoint_cfg)
+        normalize_alert_urls(alert, safe_string(self.endpoint_cfg.get("endpoint")))
         accepted = self.app.accept_alert(self.index, alert, self.signature)
         if accepted:
             log(
@@ -3733,8 +3305,6 @@ class MassNotifyApp:
             first = normalized_endpoints[0]
             self.config["endpoints"] = normalized_endpoints
             self.config["endpoint"] = first.get("endpoint", "")
-            self.config["token"] = first.get("token", "")
-            self.config["no_token"] = bool(first.get("no_token", False))
             self.config["last_event_id"] = first.get("last_event_id", "")
             self.config["last_fingerprint"] = first.get("last_fingerprint", "")
             self.config["enabled"] = bool(enabled)
@@ -3798,7 +3368,7 @@ class MassNotifyApp:
             states = [value[0] for value in self.transport_statuses.values()]
             if "AUTHENTICATED" in states:
                 live_count = states.count("AUTHENTICATED")
-                self.status_text = f"Live authenticated: {live_count} PBX profile{'s' if live_count != 1 else ''}. {detail}"
+                self.status_text = f"Connected to {live_count} PBX profile{'s' if live_count != 1 else ''}."
             else:
                 self.status_text = detail
         self.ui_queue.put(("status", self.status_text))
@@ -3810,10 +3380,7 @@ class MassNotifyApp:
             if not 0 <= index < len(self.config["endpoints"]):
                 return False
             endpoint = self.config["endpoints"][index]
-            current_interval = endpoint_poll_seconds(
-                endpoint, normalize_poll_seconds(self.config.get("poll_seconds", DEFAULT_POLL_SECONDS))
-            )
-            if worker_signature and endpoint_worker_signature(endpoint, current_interval) != worker_signature:
+            if worker_signature and endpoint_worker_signature(endpoint) != worker_signature:
                 return False
             recent_ids = [safe_string(item) for item in endpoint.get("recent_event_ids", []) if safe_string(item)]
             if dedupe_id and (dedupe_id in recent_ids or dedupe_id == safe_string(endpoint.get("last_event_id"))):
@@ -3827,7 +3394,6 @@ class MassNotifyApp:
             endpoint["last_fingerprint"] = alert.fingerprint
             first = self.config["endpoints"][0]
             self.config["endpoint"] = first.get("endpoint", "")
-            self.config["token"] = first.get("token", "")
             self.config["last_event_id"] = first.get("last_event_id", "")
             self.config["last_fingerprint"] = first.get("last_fingerprint", "")
             save_config(self.config)
@@ -3839,7 +3405,6 @@ class MassNotifyApp:
             with self.config_lock:
                 cfg = normalize_config(dict(self.config))
             enabled = bool(cfg.get("enabled", True))
-            legacy_default_interval = normalize_poll_seconds(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS))
             desired = {
                 index: endpoint_cfg
                 for index, endpoint_cfg in (
@@ -3849,22 +3414,14 @@ class MassNotifyApp:
             with self.worker_lock:
                 for index, worker in list(self.workers.items()):
                     candidate = desired.get(index)
-                    candidate_interval = (
-                        endpoint_poll_seconds(candidate, legacy_default_interval) if candidate is not None else None
-                    )
-                    if candidate is None or worker.signature != endpoint_worker_signature(candidate, candidate_interval):
+                    if candidate is None or worker.signature != endpoint_worker_signature(candidate):
                         worker.stop()
                         if not worker.thread.is_alive():
                             self.workers.pop(index, None)
                             self.transport_statuses.pop(index, None)
                 for index, endpoint_cfg in desired.items():
                     if index not in self.workers:
-                        worker = EndpointTransportWorker(
-                            self,
-                            index,
-                            endpoint_cfg,
-                            endpoint_poll_seconds(endpoint_cfg, legacy_default_interval),
-                        )
+                        worker = EndpointTransportWorker(self, index, endpoint_cfg)
                         self.workers[index] = worker
                         worker.start()
             if not desired:
@@ -3993,7 +3550,7 @@ class MassNotifyApp:
             return
         self.settings_window = SettingsWindow(self)
 
-    def transport_is_authenticated(self, index: int, endpoint_cfg: dict, poll_seconds: int) -> bool:
+    def transport_is_authenticated(self, index: int, endpoint_cfg: dict) -> bool:
         """Use the live worker as the connection test when it is already healthy."""
         with self.worker_lock:
             worker = self.workers.get(index)
@@ -4001,7 +3558,7 @@ class MassNotifyApp:
             return bool(
                 worker is not None
                 and worker.thread.is_alive()
-                and worker.signature == endpoint_worker_signature(endpoint_cfg, poll_seconds)
+                and worker.signature == endpoint_worker_signature(endpoint_cfg)
                 and status is not None
                 and status[0] == "AUTHENTICATED"
             )
@@ -4020,56 +3577,44 @@ class MassNotifyApp:
                 with self.config_lock:
                     cfg = normalize_config(dict(self.config))
                 endpoints = active_endpoints(cfg)
-                legacy_default_interval = normalize_poll_seconds(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS))
                 if not endpoints:
                     message = "No active endpoints are configured."
                     return
 
                 for index, endpoint_cfg in endpoints:
                     try:
-                        mode = normalize_delivery_mode(
-                            endpoint_cfg.get("delivery_mode"), existing_url=safe_string(endpoint_cfg.get("endpoint"))
+                        if self.transport_is_authenticated(index, endpoint_cfg):
+                            successes += 1
+                            continue
+                        response = open_sse_response(
+                            endpoint_cfg,
+                            timeout=SSE_TEST_TIMEOUT_SECONDS,
+                            read_timeout=SSE_TEST_TIMEOUT_SECONDS,
                         )
-                        if mode == DELIVERY_LIVE:
-                            if self.transport_is_authenticated(
-                                index,
-                                endpoint_cfg,
-                                endpoint_poll_seconds(endpoint_cfg, legacy_default_interval),
-                            ):
-                                successes += 1
-                                continue
-                            response = open_sse_response(
-                                endpoint_cfg,
-                                timeout=SSE_TEST_TIMEOUT_SECONDS,
-                                read_timeout=SSE_TEST_TIMEOUT_SECONDS,
-                            )
-                            try:
-                                handshake_ok = False
-                                deadline = time.monotonic() + SSE_TEST_TIMEOUT_SECONDS
+                        try:
+                            handshake_ok = False
+                            deadline = time.monotonic() + SSE_TEST_TIMEOUT_SECONDS
 
-                                def enforce_test_deadline() -> None:
-                                    if time.monotonic() > deadline:
-                                        raise ApiError("Authenticated handshake test timed out.")
+                            def enforce_test_deadline() -> None:
+                                if time.monotonic() > deadline:
+                                    raise ApiError("Authenticated handshake test timed out.")
 
-                                for event in iter_sse_events(response, on_activity=enforce_test_deadline):
-                                    if event.name != "authenticated":
-                                        raise StreamProtocolError(
-                                            f"PBX sent '{event.name}' before the authenticated handshake."
-                                        )
-                                    payload = json.loads(event.data)
-                                    handshake_ok = isinstance(payload, dict) and payload.get("ok") is True
-                                    break
-                                if not handshake_ok:
-                                    raise StreamProtocolError("Authenticated handshake was not received.")
-                            finally:
-                                response.close()
-                        else:
-                            data, _raw_text = fetch_endpoint(
-                                pbx_transport_url(endpoint_cfg, DELIVERY_POLL),
-                                endpoint_auth_headers(endpoint_cfg),
-                                allow_invalid_certificate=bool(endpoint_cfg.get("allow_invalid_certificate", False)),
-                            )
-                            ensure_api_ok(data)
+                            for event in iter_sse_events(response, on_activity=enforce_test_deadline):
+                                if event.name != "authenticated":
+                                    raise StreamProtocolError(
+                                        f"PBX sent '{event.name}' before the authenticated handshake."
+                                    )
+                                payload = json.loads(event.data)
+                                handshake_ok = (
+                                    isinstance(payload, dict)
+                                    and payload.get("ok") is True
+                                    and safe_string(payload.get("transport")) == DELIVERY_LIVE
+                                )
+                                break
+                            if not handshake_ok:
+                                raise StreamProtocolError("Authenticated handshake was not received.")
+                        finally:
+                            response.close()
                         successes += 1
                     except Exception as exc:
                         failures.append(f"{endpoint_display_name(index, endpoint_cfg)}: {exc}")
@@ -4114,8 +3659,7 @@ def remove_config_dir() -> None:
 
 def launch_uninstall_cleanup(remove_settings: bool) -> None:
     try:
-        cleanup_dir = Path(tempfile.gettempdir()) / f"{APP_SHORT_NAME}_uninstall_{os.getpid()}"
-        cleanup_dir.mkdir(parents=True, exist_ok=True)
+        cleanup_dir = Path(tempfile.mkdtemp(prefix=f"{APP_SHORT_NAME}_uninstall_"))
         cleanup_script = cleanup_dir / "finish_uninstall.ps1"
         parameters_path = cleanup_dir / "parameters.json"
         parameters_path.write_text(

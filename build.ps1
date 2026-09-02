@@ -30,6 +30,7 @@ $env:TK_LIBRARY = Join-Path $PythonBase "tcl\tk8.6"
     --windowed `
     --name SLS_Mass_Notify `
     --icon "$ProjectRoot\favicon.ico" `
+    --version-file "$ProjectRoot\version_info_app.txt" `
     --add-data "$ProjectRoot\icon.png;." `
     --add-data "$ProjectRoot\favicon.ico;." `
     --add-data "$ProjectRoot\audio;audio" `

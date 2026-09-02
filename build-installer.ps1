@@ -35,6 +35,7 @@ Write-Host "Building Program Files installer exe..." -ForegroundColor Green
     --windowed `
     --name SLS_Mass_Notify_Installer `
     --icon "$ProjectRoot\favicon.ico" `
+    --version-file "$ProjectRoot\version_info_installer.txt" `
     --add-data "$AppExe;." `
     --add-data "$ProjectRoot\favicon.ico;." `
     --add-data "$ProjectRoot\audio;audio" `

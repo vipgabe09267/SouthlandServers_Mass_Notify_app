@@ -24,7 +24,7 @@ APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 INSTALLER_EXE_NAME = "SLS_Mass_Notify_Uninstall.exe"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.7-Beta"
+APP_VERSION = "1.0.8-Beta"
 CREDENTIAL_TARGET_PREFIX = "SouthlandServers/SLS_Mass_Notify"
 AUDIO_DIR_NAME = "audio"
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -32,13 +32,13 @@ UNINSTALL_REG_PATH = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP
 
 TERMS_TEXT = """SouthlandServers Mass Notification App Terms of Service
 
-By installing or using this app, you acknowledge that it is a desktop notification client that receives alert and announcement content from user-configured PBX connections using an authenticated live stream or an explicit legacy polling fallback.
+By installing or using this app, you acknowledge that it is a desktop notification client that receives alert and announcement content from user-configured PBX connections using authenticated live streams.
 
-You are responsible for configuring endpoints, tokens, recipient systems, and server-side alert data accurately. The app does not create weather alerts, verify emergency content, or replace official emergency alerting systems.
+You are responsible for configuring endpoints, recipient systems, and server-side alert data accurately. The app does not create weather alerts, verify emergency content, or replace official emergency alerting systems.
 
-Use HTTPS PBX connections. HTTP endpoints may expose traffic to interception or modification. Certificate validation must remain enabled in production. Username/password and legacy bearer-token credentials should be kept private.
+PBX connections require HTTPS with valid certificates. Desktop credentials should be kept private.
 
-The app stores local settings under the current Windows user profile and stores saved tokens/passwords in Windows Credential Manager, with DPAPI as a compatibility fallback. The app may check GitHub Releases for updates if automatic updates are enabled during install or in Settings.
+The app stores local settings under the current Windows user profile and stores saved passwords in Windows Credential Manager, with DPAPI as a compatibility fallback. The app may check GitHub Releases for updates if automatic updates are enabled during install or in Settings.
 
 This software is provided under the GNU Affero General Public License v3.0 without warranty. You agree to test deployments before operational use and to comply with all applicable laws, policies, and emergency communication requirements."""
 
@@ -97,7 +97,7 @@ def is_admin() -> bool:
 def relaunch_as_admin() -> bool:
     if is_admin():
         return True
-    params = " ".join(f'"{arg}"' for arg in sys.argv[1:])
+    params = subprocess.list2cmdline(sys.argv[1:])
     result = ctypes.windll.shell32.ShellExecuteW(
         None,
         "runas",
@@ -107,6 +107,27 @@ def relaunch_as_admin() -> bool:
         1,
     )
     return result > 32
+
+
+def validate_install_dir(path: Path) -> Path:
+    """Reject broad or unrelated folders because uninstall removes the managed directory."""
+    resolved = path.resolve()
+    blocked = {
+        Path(resolved.anchor).resolve(),
+        PROGRAM_FILES.resolve(),
+        Path(os.environ.get("ProgramData", r"C:\ProgramData")).resolve(),
+        Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve(),
+    }
+    if resolved in blocked:
+        raise ValueError("Choose a dedicated application folder, not a Windows system folder.")
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError("The install location must be a folder.")
+    if resolved.exists():
+        entries = list(resolved.iterdir())
+        managed_install = (resolved / EXE_NAME).is_file() or (resolved / INSTALLER_EXE_NAME).is_file()
+        if entries and not managed_install:
+            raise ValueError("Choose an empty folder or the existing SLS Mass Notify install folder.")
+    return resolved
 
 
 def run_hidden(command: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
@@ -130,14 +151,14 @@ def launch_through_user_shell(app_path: Path, *, background: bool = False) -> No
     explorer = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "explorer.exe"
     if not explorer.exists():
         raise FileNotFoundError("Windows Explorer was not found; start SLS Mass Notify from the Start Menu.")
-    shortcut = Path(tempfile.gettempdir()) / f"{APP_SHORT_NAME}_launch_{os.getpid()}.lnk"
-    create_shortcut(
-        shortcut,
-        app_path,
-        arguments="--background" if background else "",
-        description=APP_DISPLAY_NAME,
-    )
-    try:
+    with tempfile.TemporaryDirectory(prefix=f"{APP_SHORT_NAME}_launch_") as directory:
+        shortcut = Path(directory) / f"{APP_SHORT_NAME}.lnk"
+        create_shortcut(
+            shortcut,
+            app_path,
+            arguments="--background" if background else "",
+            description=APP_DISPLAY_NAME,
+        )
         subprocess.Popen(
             [str(explorer), str(shortcut)],
             cwd=str(app_path.parent),
@@ -145,11 +166,6 @@ def launch_through_user_shell(app_path: Path, *, background: bool = False) -> No
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         time.sleep(0.75)
-    finally:
-        try:
-            shortcut.unlink()
-        except OSError:
-            pass
 
 
 def set_startup_enabled(enabled: bool, app_path: Path) -> None:
@@ -327,9 +343,25 @@ def write_auto_update_preference(enabled: bool | None, progress: ProgressCallbac
     except (OSError, json.JSONDecodeError):
         config = {}
     config["auto_update_enabled"] = bool(enabled)
-    temp_path = CONFIG_PATH.with_suffix(".tmp")
-    temp_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-    temp_path.replace(CONFIG_PATH)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=CONFIG_DIR,
+            prefix="settings_",
+            suffix=".tmp",
+            delete=False,
+            encoding="utf-8",
+        ) as fh:
+            json.dump(config, fh, indent=2)
+            temp_path = Path(fh.name)
+        temp_path.replace(CONFIG_PATH)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def copy_audio_assets(install_dir: Path, progress: ProgressCallback | None = None) -> None:
@@ -355,6 +387,7 @@ def install_app(
     launch_background: bool = False,
     progress: ProgressCallback | None = None,
 ) -> None:
+    install_dir = validate_install_dir(install_dir)
     app_payload = resource_path(EXE_NAME)
     if not app_payload.exists():
         raise FileNotFoundError(f"Missing bundled app payload: {app_payload}")
@@ -403,8 +436,8 @@ def install_app(
 
 
 def launch_cleanup(install_dir: Path, remove_settings: bool) -> None:
-    cleanup_dir = Path(tempfile.gettempdir()) / f"{APP_SHORT_NAME}_uninstall_{os.getpid()}"
-    cleanup_dir.mkdir(parents=True, exist_ok=True)
+    install_dir = validate_install_dir(install_dir)
+    cleanup_dir = Path(tempfile.mkdtemp(prefix=f"{APP_SHORT_NAME}_uninstall_"))
     cleanup_script = cleanup_dir / "finish_uninstall.ps1"
     parameters_path = cleanup_dir / "parameters.json"
     parameters_path.write_text(
@@ -472,7 +505,7 @@ def uninstall_app(
     if not quiet and progress is None:
         if not messagebox.askyesno(APP_DISPLAY_NAME, "Uninstall SouthlandServers Mass Notification App?"):
             return
-        remove_settings = messagebox.askyesno(APP_DISPLAY_NAME, "Remove saved endpoint settings and tokens too?")
+        remove_settings = messagebox.askyesno(APP_DISPLAY_NAME, "Remove saved PBX settings and credentials too?")
 
     emit(progress, "Stopping any running copy of SLS Mass Notify.")
     stop_running_app()
@@ -570,7 +603,7 @@ class InstallerWindow:
 
         header = ttk.Frame(self.root, padding=(20, 12), style="Header.TFrame")
         header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(header, text="SLS Mass Notify Setup", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(header, text="Install SLS Mass Notify", style="Header.TLabel").pack(anchor="w")
         ttk.Label(
             header,
             text=f"Version {APP_VERSION}",
@@ -585,8 +618,8 @@ class InstallerWindow:
         options = ttk.Frame(frame, padding=14, style="Card.TFrame")
         options.grid(row=0, column=0, columnspan=2, sticky="ew")
         options.columnconfigure(0, weight=1)
-        ttk.Label(options, text="Installation", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(options, text="Choose where the app is installed and how it starts.", style="Hint.TLabel").grid(
+        ttk.Label(options, text="Install options", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(options, text="Choose the install location and startup preferences.", style="Hint.TLabel").grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(3, 12)
         )
         ttk.Label(options, text="Install folder", style="Hint.TLabel").grid(row=2, column=0, columnspan=3, sticky="w")
@@ -687,7 +720,7 @@ class InstallerWindow:
             if not self.accept_terms.get():
                 messagebox.showwarning(APP_DISPLAY_NAME, "You must accept the Terms of Service before installing.")
                 return
-            install_dir = Path(self.install_dir.get()).resolve()
+            install_dir = validate_install_dir(Path(self.install_dir.get()))
             if self.install_button is not None:
                 self.install_button.configure(state="disabled")
             if self.cancel_button is not None:
@@ -869,7 +902,7 @@ def main() -> None:
         if not is_admin() and relaunch_as_admin():
             return
         requested_install_dir = command_line_value("--install-dir")
-        install_dir = Path(requested_install_dir).resolve() if requested_install_dir else DEFAULT_INSTALL_DIR
+        install_dir = validate_install_dir(Path(requested_install_dir) if requested_install_dir else DEFAULT_INSTALL_DIR)
         install_app(
             install_dir,
             startup=saved_startup_preference(),

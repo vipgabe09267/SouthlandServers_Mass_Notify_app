@@ -1,343 +1,169 @@
 # SouthlandServers Mass Notification App
 
-**Current version: V1.0.7-Beta**
+<p align="center">
+  <img src="SLS_Mass_Notif_App.png" alt="SLS Mass Notify desktop alert" width="620">
+</p>
 
-[![Windows](https://img.shields.io/badge/platform-Windows-0A66C2)](#install)
-[![Python](https://img.shields.io/badge/built%20with-Python-3776AB)](#build-from-source)
-[![License: AGPL v3](https://img.shields.io/badge/license-AGPLv3-blue)](LICENSE)
-[![Southland Servers](https://img.shields.io/badge/Southland%20Servers-Projects-111827)](https://southlandservers.xyz/projects)
+<p align="center">
+  <a href="#install"><img src="https://img.shields.io/badge/platform-Windows-0A66C2" alt="Windows"></a>
+  <a href="#build-and-test"><img src="https://img.shields.io/badge/built%20with-Python-3776AB" alt="Python"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPLv3-blue" alt="AGPL v3"></a>
+</p>
 
-SouthlandServers Mass Notification App is an open-source Windows desktop companion for SIP NOTIFY, emergency alert, PBX announcement, and EAS-style visual notification workflows.
+SLS Mass Notify is a Windows desktop companion for Southland Servers PBX alerting. It maintains authenticated PBX connections in the background, plays a selected WAV tone, and presents weather alerts and announcements without requiring an open browser.
 
-It runs quietly in the background, starts with Windows if enabled, maintains authenticated live PBX streams, plays the selected WAV alert tone for new events, and displays clean desktop alert windows without requiring users to keep a browser open. Legacy JSON polling remains available as an explicit compatibility fallback.
+Current release: **v1.0.8-Beta**
 
-[View Southland Servers Projects](https://southlandservers.xyz/projects)
+## Highlights
 
-![SouthlandServers Mass Notification App preview](SLS_Mass_Notif_App.png)
+- Up to three independent PBX connections
+- Authenticated live event streams with reconnect and `Last-Event-ID` resume
+- Deduplicated recovery of announcements omitted by an active stream
+- Separate layouts for weather alerts and general announcements
+- Bundled and custom WAV notification sounds
+- Optional Windows startup and verified GitHub Release updates
+- Dark settings and installer interfaces
+- Standard Windows install, Start Menu, and uninstall integration
 
-## What It Does
+## Requirements
 
-| Area | Behavior |
-| --- | --- |
-| Weather alerts | Shows NWS/SIP NOTIFY-style alert screens with title, priority, severity, area, effective time, and until/expires time. |
-| Announcements | Shows a simplified safe-format notice with a hazard icon, title, and body only. |
-| PBX profiles | Supports up to three independent PBX connections with normalized server addresses. |
-| Live delivery | Uses an authenticated SSE handshake, plus deduplicated catch-up checks so PBX stream omissions cannot silently lose targeted messages. |
-| Authentication | Uses desktop-specific HTTP Basic credentials for live mode; legacy modes remain available for migrated polling profiles. |
-| Startup | Can register itself to run automatically when Windows starts. |
-| Audio | Select bundled WAV tones from the `audio` folder, preview them, or import a custom WAV. |
-| Updates | Optional automatic update checks from GitHub Releases on startup and about every 15 minutes. |
-| Faults | Shows a desktop fault notification if an endpoint, token, or system issue remains unresolved for five minutes. |
-| Uninstall | Adds a normal Windows uninstall entry and Start Menu uninstall shortcut. |
+- Windows 10 or Windows 11
+- A PBX with the v0.0.7-beta or newer desktop live-handshake API
+- A desktop username and password created on that PBX
+- HTTPS with a certificate trusted by Windows
 
-## Screens And Event Types
-
-### Weather / NWS Alerts
-
-Weather alerts use the structured weather fields returned by the API:
-
-- `latest.title`
-- `latest.priority`
-- `latest.priority_label`
-- `latest.severity`
-- `latest.area`
-- `latest.effective`
-- `latest.expires`
-- `latest.description`
-- `latest.image_url`
-
-Priority colors:
-
-| Priority | Display Color |
-| --- | --- |
-| `critical` | Red |
-| `urgent` | Orange |
-| `advisory` / `notice` | Yellow |
-
-### Mass Notify Announcements
-
-Announcements use `latest.kind: "announcement"` and display only:
-
-- hazard triangle/exclamation symbol
-- title
-- body text
-
-The announcement window intentionally does not display endpoint internals, XML internals, IP addresses, recipients, or fake phone controls.
+Legacy JSON polling, bearer-token profiles, unauthenticated profiles, HTTP endpoints, and certificate-validation bypasses are no longer supported as of v1.0.8-Beta. Existing settings are migrated to the current profile format; PBX address, username, password, reconnect preference, and event history are preserved when available.
 
 ## Install
 
-Download the latest V1.0.7-Beta installer from the [GitHub Releases page](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases):
+Download `SLS_Mass_Notify_Installer.exe` from [GitHub Releases](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases) and run it as Administrator.
+
+The default install folder is:
 
 ```text
-SLS_Mass_Notify_Installer.exe
+C:\Program Files\Southland Servers Group\SLS Mass Notify
 ```
 
-Run the installer as Administrator. The installer will:
+The installer adds Start Menu shortcuts and a Windows Installed Apps entry. It preserves existing settings during upgrades. Windows SmartScreen may warn about unsigned builds; sign both executables before broad distribution.
 
-1. Install the app into:
+## Configure
 
-   ```text
-   C:\Program Files\Southland Servers Group\SLS Mass Notify
-   ```
+Open Settings and complete one PBX profile:
 
-2. Add Start Menu shortcuts under:
+1. Enter a friendly name and the PBX HTTPS address.
+2. Enter the desktop username and password from the PBX.
+3. Leave the profile and automatic reconnect enabled.
+4. Choose or import a notification sound.
+5. Select **Test connections**, then save the changes.
 
-   ```text
-   Southland Servers Group
-   ```
+Passwords are stored in Windows Credential Manager. DPAPI is retained only as an encrypted compatibility fallback when Credential Manager is unavailable.
 
-3. Add a Windows Installed Apps uninstall entry.
-4. Require acceptance of the [Terms of Service](TERMS_OF_SERVICE.md).
-5. Ask whether the app should run at Windows startup.
-6. Ask whether automatic GitHub update checks should be enabled.
-7. Launch the Settings window after install.
+## PBX connection contract
 
-Windows SmartScreen may warn on unsigned builds. Code signing is recommended before broad public deployment.
-
-## First Run Setup
-
-When Settings opens, configure at least one PBX profile.
-
-1. Enable the PBX profile you want to use.
-2. Enter the HTTPS PBX hostname or origin URL.
-3. Select `Live handshake (v0.0.7-beta or newer only)` for current PBX releases, or `Legacy polling fallback (v0.0.6-beta or older only)` for older PBXs.
-4. For live handshake, enter the desktop-specific username and password configured in FreePBX. Authentication is fixed to this supported method.
-5. Keep automatic reconnect enabled and certificate validation enabled.
-6. For a legacy profile, choose username/password or bearer-token authentication and set that profile's polling interval.
-7. Choose the alert audio tone or import your own `.wav`.
-8. Click `Test connections`; live tests require the named `authenticated` SSE event.
-9. Click `Save changes`.
-
-The app can monitor up to three PBXs at the same time. Each profile has its own address, credentials, delivery mode, legacy polling interval, reconnect policy, and enabled state.
-
-## How It Works
-
-The background app gives each enabled PBX its own cancellable transport worker.
-
-```mermaid
-flowchart LR
-    A[Windows Startup] --> B[SLS Mass Notify Background App]
-    B --> C[Load Settings]
-    C --> D[Open authenticated SSE stream]
-    D --> E{Authenticated event received?}
-    E -- No --> D
-    E -- Yes --> F[Wait for notification event]
-    F --> G{New event ID?}
-    G -- No --> F
-    G -- Yes --> H[Play selected WAV once]
-    H --> I{kind}
-    I -- alert --> J[Show Weather Alert Screen]
-    I -- announcement --> K[Show Safe Announcement Notice]
-    F --> L{Disconnect or bounded reconnect?}
-    L --> D
-    D --> M{Fault unresolved 5 min?}
-    M -- Yes --> N[Desktop Fault Notification]
-```
-
-Live profiles send an authenticated streaming request:
+The client opens this authenticated stream:
 
 ```http
 GET /api/sipnotify/desktop/stream HTTP/1.1
-Host: example.com
 Accept: text/event-stream
 Authorization: Basic BASE64_USERNAME_PASSWORD
 Last-Event-ID: MOST_RECENT_ACCEPTED_ID
 ```
 
-Legacy-polling profiles may use either bearer-token or username/password authentication. Live delivery always requires the desktop-specific username/password pair and therefore does not show an authentication selector.
-
-For username/password endpoints, the app sends HTTP Basic authentication:
-
-```http
-Authorization: Basic BASE64_USERNAME_PASSWORD
-```
-
-The app persists the most recent accepted event ID plus a bounded recent-ID history. Reconnects send `Last-Event-ID`; authenticated live sessions also perform a short catch-up check because some PBX streams acknowledge the handshake without pushing queued targeted announcements. Streaming, catch-up, and legacy polling paths all deduplicate before sound or display. Legacy records without an ID use a content fingerprint.
-
-## Expected API Format
-
-### Weather Alert Example
-
-```json
-{
-  "ok": true,
-  "latest": {
-    "kind": "alert",
-    "id": "urn:oid:...",
-    "event": "Tornado Warning",
-    "title": "TORNADO WARNING",
-    "priority": "critical",
-    "priority_label": "CRITICAL",
-    "severity": "Extreme",
-    "message_type": "Alert",
-    "area": "Williamson County TX",
-    "effective": "2026-06-21T08:27:32-05:00",
-    "expires": "2026-06-21T09:12:32-05:00",
-    "description": "The National Weather Service has issued...",
-    "image_url": "https://example.com/nws_visual_push/alert_xxx.png",
-    "xml": "<YealinkIPPhoneImageScreen ...>",
-    "recipients": ["1000"],
-    "created_at": "2026-06-21T08:27:32-05:00"
-  },
-  "events": []
-}
-```
-
-### Announcement Example
-
-```json
-{
-  "ok": true,
-  "latest": {
-    "kind": "announcement",
-    "id": "announcement-20260621182234",
-    "event": "Announcement",
-    "title": "Announcement",
-    "priority": "notice",
-    "priority_label": "ADVISORY",
-    "beep": "yes",
-    "body": "Mass notify body verification test 2",
-    "text": "Mass notify body verification test 2",
-    "description": "Mass notify body verification test 2",
-    "message": "Mass notify body verification test 2",
-    "image_url": "",
-    "xml": "<YealinkIPPhoneTextScreen Beep='yes'>...</YealinkIPPhoneTextScreen>",
-    "recipients": [],
-    "created_at": "2026-06-21T13:22:34.632063-05:00"
-  },
-  "events": []
-}
-```
-
-## Custom Audio
-
-V1.0.7-Beta keeps alert sounds in the `audio` folder. The default tone is:
+The first named event must authenticate the session:
 
 ```text
-audio\Announcement.wav
+event: authenticated
+data: {"ok":true,"transport":"live_sse","session_id":"...","client_id":"..."}
 ```
 
-Bundled WAV files are packaged with the app and copied into Program Files during install. Settings includes:
+Notifications arrive as named `notification` events. A record is shown only when `desktop_all` is `true` or the configured desktop username appears in `desktop_recipients`.
 
-- a dropdown of available `.wav` files
-- a `Play` button to preview the selected tone
-- an `Import WAV` button for custom alert audio
+While a stream is authenticated, the app also reconciles recent records from `/api/sipnotify/desktop?limit=25`. This closes a PBX delivery gap where a targeted announcement can be queued but not emitted on the stream. Stream and reconciliation records share the same event-ID history, so a notification is shown and sounded once.
 
-Imported audio is copied to:
+Example announcement payload:
+
+```json
+{
+  "id": "announcement-20260902153000",
+  "kind": "announcement",
+  "title": "Building Notice",
+  "message": "The west entrance is temporarily closed.",
+  "desktop_all": false,
+  "desktop_recipients": ["frontdesk"]
+}
+```
+
+Weather records may also include `priority`, `severity`, `area`, `effective`, `expires`, `description`, and a same-origin HTTPS `image_url`.
+
+## Security
+
+- PBX credentials are sent only over HTTPS.
+- Certificate validation is always enabled.
+- Redirects on authenticated PBX and media requests are restricted to the original origin.
+- Alert images must use the same HTTPS origin as the PBX and are limited to 5 MB.
+- JSON reconciliation responses are limited to 1 MB; SSE line and event sizes are bounded.
+- XML content is parsed with `defusedxml`.
+- Saved passwords use Windows Credential Manager, with DPAPI fallback.
+- Automatic updates accept only this repository's expected installer asset and require its published SHA-256 digest to match before launch.
+- The installer rejects broad system folders and unrelated non-empty folders so uninstall cannot remove an unmanaged directory.
+
+Application settings are stored at:
+
+```text
+%APPDATA%\SouthlandServers\SLS_Mass_Notify\settings.json
+```
+
+## Audio
+
+Bundled WAV files live in `audio`; the default is `Announcement.wav`. Custom WAV files must be smaller than 25 MB and are copied to:
 
 ```text
 %APPDATA%\SouthlandServers\SLS_Mass_Notify\audio
 ```
 
-Only `.wav` files under 25 MB are accepted for custom imports.
+## Updates
 
-## Security Notes
+When enabled, the app checks published releases from `vipgabe09267/SouthlandServers_Mass_Notify_app`. Version ordering understands beta and release-candidate tags. Applying an update requires Windows administrator approval because the app is installed under Program Files.
 
-- Live PBX profiles require `https://`.
-- Invalid-certificate and legacy HTTP-media switches are disabled by default and visibly marked unsafe.
-- No-auth endpoints show a yellow caution because requests may not be fully authenticated.
-- PBX passwords and legacy tokens are stored in Windows Credential Manager. DPAPI remains a migration/fallback path.
-- Settings are stored under:
+## Build and test
 
-  ```text
-  %APPDATA%\SouthlandServers\SLS_Mass_Notify\settings.json
-  ```
-
-- The exact XML payload remains available from the raw XML view, but the normal visible alert screens are driven by clean API fields.
-- Server-side token storage at `/etc/nws_sipnotify_api.token`, 401 handling, Apache routing, and 256-bit token generation remain server responsibilities.
-
-## Automatic Updates
-
-Automatic updates are optional.
-
-When enabled, the app checks this GitHub repository shortly after startup and about every 15 minutes while running:
-
-```text
-vipgabe09267/SouthlandServers_Mass_Notify_app
-```
-
-The updater watches GitHub Releases. When a newer published, non-draft release is available, the app downloads the release asset named:
-
-```text
-SLS_Mass_Notify_Installer.exe
-```
-
-Release tags are compared with the running app version, including beta/RC ordering, so an older install updates even if it has never recorded a previous release ID. The download must come from this repository and match the SHA-256 digest published by GitHub before it can run.
-
-The installer is launched in update mode through the Windows elevation flow. Because the app installs into Program Files, Windows requests administrator approval before applying the update. Existing endpoint, audio, startup, and automatic-update preferences are preserved.
-
-## Uninstall
-
-Use either method:
-
-```text
-Start Menu > Southland Servers Group > Uninstall SouthlandServers Mass Notification App
-```
-
-or:
-
-```text
-Windows Settings > Apps > Installed Apps
-```
-
-The uninstaller removes startup entries, Start Menu shortcuts, installed app files, and optionally saved endpoint settings/tokens.
-
-## Build From Source
-
-Install build requirements:
+Python 3.13 is used by the provided PowerShell scripts. Build dependencies are pinned in `requirements-build.txt`.
 
 ```powershell
-py -m pip install -r requirements-build.txt
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.\.venv\Scripts\python.exe -m unittest -v
 ```
 
-Build the standalone background app:
+Build the app and installer:
 
 ```powershell
 .\build.ps1 -Clean
+.\build-installer.ps1
 ```
 
-Output:
+Outputs:
 
 ```text
 dist\SLS_Mass_Notify.exe
-```
-
-Build the installable setup app:
-
-```powershell
-.\build-installer.ps1 -Clean
-```
-
-Output:
-
-```text
 dist\SLS_Mass_Notify_Installer.exe
 ```
 
-## Release Checklist
+Optional local security checks:
 
-Before publishing a release:
+```powershell
+.\.venv\Scripts\python.exe -m pip_audit -r requirements-build.txt
+.\.venv\Scripts\python.exe -m bandit -q -r sls_mass_notify.py sls_installer.py
+```
 
-1. Confirm `APP_VERSION` is still `1.0.7-Beta` for this V1.0.7-Beta release.
-2. Rebuild with `.\build-installer.ps1 -Clean`.
-3. Test install, Terms acceptance, settings save, live authenticated handshake, targeted and all-desktop delivery, reconnect/resume, explicit JSON fallback, supplied colors, TEST ONLY banner, audio, uninstall, and update preference.
-4. Attach `dist\SLS_Mass_Notify_Installer.exe` to the GitHub Release.
-5. Code sign the app and installer when a signing certificate is available.
+## Uninstall
 
-## Project Status
+Use Windows **Settings > Apps > Installed apps**, or the uninstall shortcut under **Start Menu > Southland Servers Group**. Saved settings and credentials can be retained or removed.
 
-V1.0.7-Beta includes production transport and security hardening. Broad emergency-use deployment still requires environment-specific PBX integration testing and signed release artifacts.
+## Operational note
 
-Recommended hardening before broad public production rollout:
-
-- code signing and installer signing
-- CI-based release builds
-- automated endpoint integration tests
-- crash reporting or stronger log rotation
-- signed update verification
+Test PBX authentication, targeted delivery, all-desktop delivery, reconnect/resume, audio, and alert presentation in the deployment environment before relying on the app. This client complements PBX alerting and does not replace official emergency-warning systems.
 
 ## License
 
-This project is open source under the [GNU Affero General Public License v3.0](LICENSE).
-
-Contributions, forks, audits, and integrations are welcome under the same copyleft license terms.
+Licensed under the [GNU Affero General Public License v3.0](LICENSE).
