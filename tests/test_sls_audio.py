@@ -37,7 +37,7 @@ class WavTests(unittest.TestCase):
         self.assertEqual(info.codec, "G.711 mu-law")
 
     def test_bundled_wavs_are_supported_without_playback(self):
-        for path in (pathlib.Path(__file__).parent / "audio").glob("*.wav"):
+        for path in (pathlib.Path(__file__).resolve().parents[1] / "audio").glob("*.wav"):
             with self.subTest(path=path.name):
                 info = sls_audio.inspect_wav(path)
                 self.assertTrue(info.supported)

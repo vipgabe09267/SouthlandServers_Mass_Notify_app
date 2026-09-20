@@ -6,7 +6,7 @@ from unittest import mock
 import sls_mass_notify as client
 from sls_presentation import presentation_policy
 from sls_store import Inbox
-from test_sls_client_reliability import IsolatedClientTest, authenticated, notification, sse
+from tests.test_sls_client_reliability import IsolatedClientTest, authenticated, notification, sse
 
 
 def stamp(seconds):

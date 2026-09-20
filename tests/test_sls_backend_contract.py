@@ -11,7 +11,7 @@ from sls_presentation import explicit_test_mode, presentation_policy
 from sls_protocol import ordered_reconciliation, validate_payload
 
 
-FIXTURE = json.loads((Path(__file__).parent / "tests/fixtures/desktop_contract.json").read_text(encoding="utf-8"))
+FIXTURE = json.loads((Path(__file__).parent / "fixtures/desktop_contract.json").read_text(encoding="utf-8"))
 
 
 def record(group, name):

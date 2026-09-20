@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from unittest import mock
 import sls_mass_notify as client
 from sls_protocol import LiveSnapshotBaseline
-from test_sls_client_reliability import IsolatedClientTest, notification, authenticated
+from tests.test_sls_client_reliability import IsolatedClientTest, notification, authenticated
 
 
 def notice(name, when, **extra):

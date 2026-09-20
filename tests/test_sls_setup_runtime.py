@@ -8,7 +8,7 @@ from unittest import mock
 import sls_installer as installer
 import sls_install_windows as windows
 import sls_mass_notify as client
-from test_sls_client_reliability import IsolatedClientTest
+from tests.test_sls_client_reliability import IsolatedClientTest
 
 
 class ProcessShutdownTests(unittest.TestCase):
