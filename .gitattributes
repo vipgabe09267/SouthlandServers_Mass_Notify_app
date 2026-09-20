@@ -1,0 +1,2 @@
+# Preserve the backend patch as applicable text; its context lines contain whitespace.
+backend-fixes/*.patch text eol=lf -whitespace

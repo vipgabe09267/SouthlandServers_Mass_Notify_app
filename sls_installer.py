@@ -1,17 +1,32 @@
 from __future__ import annotations
 
 import ctypes
+import base64
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
+import threading
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, Text, Tk, filedialog, messagebox
 from tkinter import ttk
 from typing import Callable
+
+from sls_install_safety import (
+    FileTransaction, MANIFEST_NAME, TRANSACTION_NAME, PRODUCT_ID, digest, manifest_for,
+    prune_empty, read_manifest, reject_reparse, remove_exact_files,
+    remove_staging, write_json,
+)
+from sls_windowing import fit_window, ScrollableBody
+from sls_version import VERSION as APP_VERSION
+from sls_install_windows import (
+    close_exact_processes, delete_after_reboot, program_files_directory,
+    system_directory, verify_protected_directory, protect_new_directory,
+    executable_identity, shortcut_identity,
+)
 
 try:
     import winreg
@@ -23,8 +38,9 @@ APP_DISPLAY_NAME = "SouthlandServers Mass Notification App"
 APP_SHORT_NAME = "SLS_Mass_Notify"
 EXE_NAME = "SLS_Mass_Notify.exe"
 INSTALLER_EXE_NAME = "SLS_Mass_Notify_Uninstall.exe"
+MAINTENANCE_DIR = ".maintenance"
+DEFAULTS_NAME = "installation-defaults.json"
 COMPANY_DISPLAY_NAME = "Southland Servers Group"
-APP_VERSION = "1.0.8-Beta"
 CREDENTIAL_TARGET_PREFIX = "SouthlandServers/SLS_Mass_Notify"
 AUDIO_DIR_NAME = "audio"
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -38,18 +54,11 @@ You are responsible for configuring endpoints, recipient systems, and server-sid
 
 PBX connections require HTTPS with valid certificates. Desktop credentials should be kept private.
 
-The app stores local settings under the current Windows user profile and stores saved passwords in Windows Credential Manager, with DPAPI as a compatibility fallback. The app may check GitHub Releases for updates if automatic updates are enabled during install or in Settings.
+The app stores local settings under the current Windows user profile and stores saved passwords in Windows Credential Manager, with DPAPI as a compatibility fallback. Optional update downloads from GitHub Releases are available for administrator review. Installing an update requires administrator-controlled verification and deployment.
 
 This software is provided under the GNU Affero General Public License v3.0 without warranty. You agree to test deployments before operational use and to comply with all applicable laws, policies, and emergency communication requirements."""
 
 PROGRAM_FILES = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-POWERSHELL_EXE = (
-    Path(os.environ.get("SystemRoot", r"C:\Windows"))
-    / "System32"
-    / "WindowsPowerShell"
-    / "v1.0"
-    / "powershell.exe"
-)
 DEFAULT_INSTALL_DIR = PROGRAM_FILES / COMPANY_DISPLAY_NAME / "SLS Mass Notify"
 START_MENU_DIR = (
     Path(os.environ.get("ProgramData", r"C:\ProgramData"))
@@ -70,8 +79,13 @@ LEGACY_START_MENU_DIR = (
     / "Programs"
     / "SouthlandServers"
 )
+STARTUP_DIR = START_MENU_DIR.parent / "Startup"
 
 ProgressCallback = Callable[[str], None]
+
+
+class ElevationRequired(PermissionError):
+    """A distinct exit status for an unelevated invocation or declined UAC."""
 
 
 def emit(progress: ProgressCallback | None, message: str) -> None:
@@ -97,8 +111,22 @@ def is_admin() -> bool:
 def relaunch_as_admin() -> bool:
     if is_admin():
         return True
-    params = subprocess.list2cmdline(sys.argv[1:])
-    result = ctypes.windll.shell32.ShellExecuteW(
+    # A user-writable onedir runtime must not be automatically elevated: DLLs
+    # load before Python could verify their integrity. Deploy from a protected
+    # administrator-controlled directory or launch from an elevated console.
+    if getattr(sys, "frozen", False):
+        package = Path(sys.executable).absolute().parent
+        reject_reparse(package)
+        for item in (package, *package.rglob("*")):
+            reject_reparse(item)
+            verify_protected_directory(item)
+    arguments = sys.argv[1:] if getattr(sys, "frozen", False) else [str(Path(__file__).resolve()), *sys.argv[1:]]
+    params = subprocess.list2cmdline(arguments)
+    shell_execute = ctypes.windll.shell32.ShellExecuteW
+    shell_execute.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                              ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+    shell_execute.restype = ctypes.c_void_p
+    result = shell_execute(
         None,
         "runas",
         sys.executable,
@@ -106,85 +134,109 @@ def relaunch_as_admin() -> bool:
         None,
         1,
     )
-    return result > 32
+    return bool(result and result > 32)
 
 
 def validate_install_dir(path: Path) -> Path:
-    """Reject broad or unrelated folders because uninstall removes the managed directory."""
+    """Allow only protected dedicated machine-install directories with ownership."""
+    reject_reparse(path.absolute())
     resolved = path.resolve()
-    blocked = {
-        Path(resolved.anchor).resolve(),
-        PROGRAM_FILES.resolve(),
-        Path(os.environ.get("ProgramData", r"C:\ProgramData")).resolve(),
-        Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve(),
-    }
-    if resolved in blocked:
-        raise ValueError("Choose a dedicated application folder, not a Windows system folder.")
+    protected_root = program_files_directory().resolve() if os.name == "nt" else PROGRAM_FILES.resolve()
+    if resolved == protected_root or not resolved.is_relative_to(protected_root):
+        raise ValueError("Choose a dedicated application folder inside Windows Program Files.")
     if resolved.exists() and not resolved.is_dir():
         raise ValueError("The install location must be a folder.")
+    if os.name == "nt":
+        for ancestor in (resolved, *resolved.parents):
+            if ancestor.exists():
+                verify_protected_directory(ancestor)
+            if ancestor == protected_root:
+                break
     if resolved.exists():
+        if (resolved / TRANSACTION_NAME).exists():
+            raise RuntimeError("An interrupted upgrade needs administrator recovery; its journal and backup were retained.")
         entries = list(resolved.iterdir())
-        managed_install = (resolved / EXE_NAME).is_file() or (resolved / INSTALLER_EXE_NAME).is_file()
-        if entries and not managed_install:
-            raise ValueError("Choose an empty folder or the existing SLS Mass Notify install folder.")
+        if entries:
+            installation_manifest(resolved)
     return resolved
 
 
+def installation_manifest(root: Path) -> dict:
+    """Recognize only the registered, protected 1.0.8 installation for migration.
+
+    A filename alone never establishes ownership. Unrelated files and legacy
+    audio remain unowned; the transaction backs up only positively identified EXEs.
+    This function is read-only, including when the installer window opens.
+    """
+    if (root / MANIFEST_NAME).exists():
+        return read_manifest(root)
+    if not root.exists() or not any(root.iterdir()):
+        return {}
+    registration = snapshot_uninstall_registry() or {}
+    values = {name: item[0] for name, item in registration.items()}
+    expected = {"DisplayName": APP_DISPLAY_NAME, "Publisher": COMPANY_DISPLAY_NAME,
+                "UninstallString": f'"{root / INSTALLER_EXE_NAME}" --uninstall'}
+    if (any(values.get(name) != value for name, value in expected.items())
+            or str(values.get("DisplayVersion", "")).lower() != "1.0.8-beta"
+            or os.path.normcase(str(root.resolve())) != os.path.normcase(str(Path(values.get("InstallLocation", "")).resolve()))):
+        raise ValueError("This nonempty folder is not a recognized SLS installation. Choose an empty Program Files folder.")
+    reject_reparse(root)
+    verify_protected_directory(root)
+    files = {}
+    for name, original in ((EXE_NAME, EXE_NAME), (INSTALLER_EXE_NAME, "SLS_Mass_Notify_Installer.exe")):
+        path = root / name
+        reject_reparse(path)
+        verify_protected_directory(path)
+        identity = executable_identity(path)
+        if (identity.get("ProductName") != APP_DISPLAY_NAME or identity.get("CompanyName") != COMPANY_DISPLAY_NAME
+                or identity.get("FileVersion", "").lower() != "1.0.8-beta" or identity.get("OriginalFilename") != original):
+            raise ValueError(f"The legacy executable does not match the registered SLS product: {path}")
+        files[name] = digest(path)
+    shortcuts = {}
+    for key, path in machine_shortcuts().items():
+        if not path.exists():
+            continue
+        reject_reparse(path)
+        verify_protected_directory(path, allow_shell_delete=True)
+        link = shortcut_identity(path)
+        target = root / (INSTALLER_EXE_NAME if key == "uninstall" else EXE_NAME)
+        allowed = {"--uninstall"} if key == "uninstall" else ({"--background"} if key == "startup" else {"", "--settings"})
+        if (os.path.normcase(str(Path(link.get("target", "")).resolve())) != os.path.normcase(str(target.resolve()))
+                or link.get("arguments", "").strip() not in allowed):
+            raise ValueError(f"The existing shortcut belongs to another target and will not be replaced: {path}")
+        shortcuts[key] = digest(path)
+    return {"schema": 1, "product": PRODUCT_ID, "version": values["DisplayVersion"],
+            "files": files, "shortcuts": shortcuts}
+
+
 def run_hidden(command: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
+    if not command or not Path(command[0]).is_absolute():
+        raise ValueError("Installer subprocesses require a trusted absolute executable path.")
     return subprocess.run(
         command,
         check=False,
         timeout=timeout,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        cwd=str(system_directory()) if os.name == "nt" else str(Path(command[0]).parent),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
 
-def stop_running_app() -> None:
-    run_hidden(["taskkill.exe", "/IM", EXE_NAME, "/F"], timeout=10)
-    time.sleep(0.5)
+def stop_running_app(install_dir: Path, progress: ProgressCallback | None = None) -> None:
+    close_exact_processes(install_dir / EXE_NAME, force=True, progress=progress)
 
 
 def launch_through_user_shell(app_path: Path, *, background: bool = False) -> None:
     """Launch through the existing Explorer shell so the app does not inherit Setup elevation."""
-    explorer = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "explorer.exe"
+    explorer = system_directory().parent / "explorer.exe"
     if not explorer.exists():
         raise FileNotFoundError("Windows Explorer was not found; start SLS Mass Notify from the Start Menu.")
-    with tempfile.TemporaryDirectory(prefix=f"{APP_SHORT_NAME}_launch_") as directory:
-        shortcut = Path(directory) / f"{APP_SHORT_NAME}.lnk"
-        create_shortcut(
-            shortcut,
-            app_path,
-            arguments="--background" if background else "",
-            description=APP_DISPLAY_NAME,
-        )
-        subprocess.Popen(
-            [str(explorer), str(shortcut)],
-            cwd=str(app_path.parent),
-            close_fds=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        time.sleep(0.75)
-
-
-def set_startup_enabled(enabled: bool, app_path: Path) -> None:
-    if winreg is None:
-        return
-    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
-        if enabled:
-            winreg.SetValueEx(
-                key,
-                APP_SHORT_NAME,
-                0,
-                winreg.REG_SZ,
-                f'"{app_path}" --background',
-            )
-        else:
-            try:
-                winreg.DeleteValue(key, APP_SHORT_NAME)
-            except FileNotFoundError:
-                pass
+    shortcut = STARTUP_DIR / f"{APP_DISPLAY_NAME}.lnk" if background else START_MENU_DIR / f"{APP_DISPLAY_NAME}.lnk"
+    subprocess.Popen(
+        [str(explorer), str(shortcut)], cwd=str(app_path.parent), close_fds=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
 
 
 def startup_entry_enabled() -> bool:
@@ -223,72 +275,83 @@ def command_line_value(name: str) -> str:
 
 
 def remove_legacy_entries() -> None:
-    if winreg is not None:
-        try:
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_REG_PATH)
-        except OSError:
-            pass
-    if LEGACY_INSTALL_DIR.exists():
-        shutil.rmtree(LEGACY_INSTALL_DIR, ignore_errors=True)
-    try:
-        LEGACY_INSTALL_DIR.parent.rmdir()
-    except OSError:
-        pass
-    if LEGACY_START_MENU_DIR.exists():
-        shutil.rmtree(LEGACY_START_MENU_DIR, ignore_errors=True)
+    """Legacy directories lack ownership manifests and are deliberately retained."""
+    return
 
 
 def create_shortcut(shortcut_path: Path, target_path: Path, *, arguments: str = "", description: str = "") -> None:
-    shortcut_path.parent.mkdir(parents=True, exist_ok=True)
-    script = r"""
-param(
-    [string]$ShortcutPath,
-    [string]$TargetPath,
-    [string]$Arguments,
-    [string]$Description,
-    [string]$WorkingDirectory
-)
-$shell = New-Object -ComObject WScript.Shell
-$shortcut = $shell.CreateShortcut($ShortcutPath)
-$shortcut.TargetPath = $TargetPath
-$shortcut.Arguments = $Arguments
-$shortcut.Description = $Description
-$shortcut.IconLocation = $TargetPath
-$shortcut.WorkingDirectory = $WorkingDirectory
-$shortcut.Save()
-"""
-    with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as fh:
-        fh.write(script)
-        script_path = Path(fh.name)
-    try:
-        result = run_hidden(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(script_path),
-                "-ShortcutPath",
-                str(shortcut_path),
-                "-TargetPath",
-                str(target_path),
-                "-Arguments",
-                arguments,
-                "-Description",
-                description,
-                "-WorkingDirectory",
-                str(target_path.parent),
-            ],
-            timeout=20,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"PowerShell shortcut creation failed: {result.returncode}")
-    finally:
+    reject_reparse(shortcut_path)
+    create_protected_directories(shortcut_path.parent, allow_shell_delete=True)
+    if os.name == "nt":
+        verify_protected_directory(shortcut_path.parent, allow_shell_delete=True)
+    data = base64.b64encode(json.dumps({
+        "shortcut": str(shortcut_path), "target": str(target_path),
+        "arguments": arguments, "description": description,
+        "directory": str(target_path.parent),
+    }).encode("utf-8")).decode("ascii")
+    # Constant script + base64 JSON avoids command interpolation and a mutable
+    # privileged .ps1 file. PowerShell itself comes from GetSystemDirectoryW.
+    script = (
+        "$ErrorActionPreference='Stop'; "
+        "$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + data + "'))|ConvertFrom-Json; "
+        "$s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut($p.shortcut); "
+        "$l.TargetPath=$p.target; $l.Arguments=$p.arguments; $l.Description=$p.description; "
+        "$l.IconLocation=$p.target; $l.WorkingDirectory=$p.directory; $l.Save()"
+    )
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    executable = system_directory() / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    result = run_hidden([str(executable), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], timeout=20)
+    if result.returncode != 0 or not shortcut_path.is_file():
+        raise RuntimeError(f"Shortcut creation failed: {result.returncode}")
+
+
+def registered_install_dir() -> Path:
+    if winreg is not None:
         try:
-            script_path.unlink()
-        except OSError:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_REG_PATH, 0, winreg.KEY_READ) as key:
+                value, _ = winreg.QueryValueEx(key, "InstallLocation")
+            candidate = Path(value)
+            return validate_install_dir(candidate)
+        except (OSError, ValueError):
             pass
+    return DEFAULT_INSTALL_DIR
+
+
+def saved_machine_preference(name: str, default: bool) -> bool:
+    path = registered_install_dir() / DEFAULTS_NAME
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict) and isinstance(value.get(name), bool):
+            return value[name]
+    except (OSError, ValueError):
+        pass
+    return default
+
+
+def installed_uninstaller(install_dir: Path) -> Path:
+    return install_dir / MAINTENANCE_DIR / Path(sys.executable).name
+
+
+def snapshot_uninstall_registry() -> dict | None:
+    if winreg is None:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_REG_PATH, 0, winreg.KEY_READ) as key:
+            values = {}
+            for index in range(winreg.QueryInfoKey(key)[1]):
+                name, value, kind = winreg.EnumValue(key, index)
+                values[name] = (value, kind)
+            return values
+    except FileNotFoundError:
+        return None
+
+
+def restore_uninstall_registry(values: dict | None) -> None:
+    remove_uninstall_registry()
+    if values is not None and winreg is not None:
+        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
+            for name, (value, kind) in values.items():
+                winreg.SetValueEx(key, name, 0, kind, value)
 
 
 def write_uninstall_registry(install_dir: Path, progress: ProgressCallback | None = None) -> None:
@@ -296,10 +359,10 @@ def write_uninstall_registry(install_dir: Path, progress: ProgressCallback | Non
         return
     emit(progress, "Registering Windows uninstall entry.")
     app_path = install_dir / EXE_NAME
-    uninstaller_path = install_dir / INSTALLER_EXE_NAME
+    uninstaller_path = installed_uninstaller(install_dir)
     install_size_kb = max(
         1,
-        sum(file.stat().st_size for file in install_dir.glob("*") if file.is_file()) // 1024,
+        sum(file.stat().st_size for file in install_dir.rglob("*") if file.is_file()) // 1024,
     )
     with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
         winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, APP_DISPLAY_NAME)
@@ -313,7 +376,7 @@ def write_uninstall_registry(install_dir: Path, progress: ProgressCallback | Non
             "QuietUninstallString",
             0,
             winreg.REG_SZ,
-            f'"{uninstaller_path}" --uninstall',
+            f'"{uninstaller_path}" --uninstall --quiet',
         )
         winreg.SetValueEx(key, "NoModify", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(key, "NoRepair", 0, winreg.REG_DWORD, 1)
@@ -325,221 +388,204 @@ def remove_uninstall_registry() -> None:
         return
     try:
         winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_REG_PATH)
-    except OSError:
+    except FileNotFoundError:
         pass
 
 
-def write_auto_update_preference(enabled: bool | None, progress: ProgressCallback | None = None) -> None:
-    if enabled is None:
-        return
-    emit(progress, "Saving automatic update preference.")
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    config: dict = {}
-    try:
-        if CONFIG_PATH.exists():
-            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                config = loaded
-    except (OSError, json.JSONDecodeError):
-        config = {}
-    config["auto_update_enabled"] = bool(enabled)
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            dir=CONFIG_DIR,
-            prefix="settings_",
-            suffix=".tmp",
-            delete=False,
-            encoding="utf-8",
-        ) as fh:
-            json.dump(config, fh, indent=2)
-            temp_path = Path(fh.name)
-        temp_path.replace(CONFIG_PATH)
-    finally:
-        if temp_path is not None and temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
+def require_admin() -> None:
+    if os.name != "nt" or not is_admin():
+        raise ElevationRequired("An elevated Windows administrator session is required.")
 
 
-def copy_audio_assets(install_dir: Path, progress: ProgressCallback | None = None) -> None:
-    audio_source = resource_path(AUDIO_DIR_NAME)
-    if not audio_source.exists() or not audio_source.is_dir():
-        emit(progress, "Bundled audio folder was not found; skipping audio asset copy.")
-        return
-    audio_destination = install_dir / AUDIO_DIR_NAME
-    emit(progress, f"Installing alert audio to {audio_destination}")
-    audio_destination.mkdir(parents=True, exist_ok=True)
-    for source in audio_source.glob("*.wav"):
-        if source.is_file():
-            shutil.copy2(source, audio_destination / source.name)
+def machine_shortcuts() -> dict[str, Path]:
+    return {
+        "application": START_MENU_DIR / f"{APP_DISPLAY_NAME}.lnk",
+        "uninstall": START_MENU_DIR / f"Uninstall {APP_DISPLAY_NAME}.lnk",
+        "startup": STARTUP_DIR / f"{APP_DISPLAY_NAME}.lnk",
+    }
+
+
+def create_protected_directories(path: Path, *, allow_shell_delete: bool = False) -> None:
+    """Create protected folders, applying shell deletion policy only for links.
+
+    Existing Start Menu ancestors can allow users to delete entries without
+    granting permission to create or modify them. Code/staging callers retain
+    the strict default, and newly created directories always get strict ACLs.
+    """
+    reject_reparse(path)
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    verify_protected_directory(current, allow_shell_delete=allow_shell_delete)
+    for directory in reversed(missing):
+        directory.mkdir()
+        protect_new_directory(directory)
+
+
+def copy_payload_tree(source: Path, destination: Path, *, skip: Path | None = None) -> None:
+    reject_reparse(source)
+    source = source.resolve()
+    if skip is not None:
+        reject_reparse(skip)
+        skip = skip.resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"Missing onedir package: {source}")
+    for item in source.rglob("*"):
+        reject_reparse(item)
+        if skip is not None and (item == skip or item.is_relative_to(skip)):
+            continue
+        if item.is_file():
+            target = destination / item.relative_to(source)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+
+
+def stage_payload(stage: Path) -> None:
+    app_payload = resource_path(APP_SHORT_NAME)
+    if not (app_payload / EXE_NAME).is_file():
+        raise FileNotFoundError(f"Missing bundled onedir app payload: {app_payload / EXE_NAME}")
+    copy_payload_tree(app_payload, stage)
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError("Install from the packaged onedir installer, not the source script.")
+    setup_dir = Path(sys.executable).resolve().parent
+    if not (setup_dir / "_internal").is_dir():
+        raise RuntimeError("Elevated onefile installers are unsupported. Use the complete onedir release package.")
+    copy_payload_tree(setup_dir, stage / MAINTENANCE_DIR, skip=app_payload)
+
+
+def validate_shortcut_ownership(previous: dict) -> dict[str, bytes | None]:
+    snapshots = {}
+    expected = previous.get("shortcuts", {})
+    for key, path in machine_shortcuts().items():
+        reject_reparse(path)
+        if path.exists():
+            if not path.is_file() or digest(path) != expected.get(key):
+                raise ValueError(f"An unowned or changed shortcut will not be overwritten: {path}")
+            snapshots[key] = path.read_bytes()
+        else:
+            snapshots[key] = None
+    return snapshots
 
 
 def install_app(
-    install_dir: Path,
-    *,
-    startup: bool,
-    launch: bool,
-    remove_legacy: bool,
-    auto_update: bool | None,
-    launch_background: bool = False,
+    install_dir: Path, *, startup: bool | None, launch: bool, remove_legacy: bool,
+    auto_update: bool | None, launch_background: bool = False,
     progress: ProgressCallback | None = None,
 ) -> None:
+    require_admin()
     install_dir = validate_install_dir(install_dir)
-    app_payload = resource_path(EXE_NAME)
-    if not app_payload.exists():
-        raise FileNotFoundError(f"Missing bundled app payload: {app_payload}")
-
-    emit(progress, "Stopping any running copy of SLS Mass Notify.")
-    stop_running_app()
+    previous = installation_manifest(install_dir)
+    preferences = {"startup_enabled": True, "auto_update_enabled": False}
+    if previous and (install_dir / DEFAULTS_NAME).exists():
+        loaded = json.loads((install_dir / DEFAULTS_NAME).read_text(encoding="utf-8"))
+        for key in preferences:
+            if isinstance(loaded.get(key), bool):
+                preferences[key] = loaded[key]
+    if startup is not None:
+        preferences["startup_enabled"] = bool(startup)
+    if auto_update is not None:
+        preferences["auto_update_enabled"] = bool(auto_update)
+    snapshots = validate_shortcut_ownership(previous)
+    registration = snapshot_uninstall_registry()
+    create_protected_directories(install_dir.parent)
+    verify_protected_directory(install_dir.parent)
+    stage = Path(tempfile.mkdtemp(prefix=".sls-stage-", dir=install_dir.parent))
+    try:
+        protect_new_directory(stage)
+        emit(progress, "Staging and validating the complete application package.")
+        stage_payload(stage)
+        write_json(stage / DEFAULTS_NAME, preferences)
+        manifest = manifest_for(stage, version=APP_VERSION)
+        emit(progress, "Closing the installed application before replacing files.")
+        stop_running_app(install_dir, progress)
+        with FileTransaction(install_dir, stage, manifest, secure_directory=protect_new_directory, previous=previous) as transaction:
+            try:
+                verify_protected_directory(install_dir)
+                shortcuts = machine_shortcuts()
+                create_shortcut(shortcuts["application"], install_dir / EXE_NAME, description=APP_DISPLAY_NAME)
+                create_shortcut(shortcuts["uninstall"], installed_uninstaller(install_dir),
+                                arguments="--uninstall", description=f"Uninstall {APP_DISPLAY_NAME}")
+                if preferences["startup_enabled"]:
+                    create_shortcut(shortcuts["startup"], install_dir / EXE_NAME,
+                                    arguments="--background", description=APP_DISPLAY_NAME)
+                else:
+                    shortcuts["startup"].unlink(missing_ok=True)
+                manifest["shortcuts"] = {key: digest(path) for key, path in shortcuts.items() if path.exists()}
+                write_uninstall_registry(install_dir, progress)
+                transaction.commit()
+            except BaseException:
+                # Restore machine integration before the context restores files.
+                for key, original in snapshots.items():
+                    path = machine_shortcuts()[key]
+                    if original is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.write_bytes(original)
+                restore_uninstall_registry(registration)
+                raise
+    finally:
+        remove_staging(stage)
     if remove_legacy:
-        emit(progress, "Removing old LocalAppData prototype install if it exists.")
-        remove_legacy_entries()
-
-    emit(progress, f"Creating install folder: {install_dir}")
-    install_dir.mkdir(parents=True, exist_ok=True)
-    app_path = install_dir / EXE_NAME
-    uninstaller_path = install_dir / INSTALLER_EXE_NAME
-
-    emit(progress, f"Installing {EXE_NAME} to {app_path}")
-    shutil.copy2(app_payload, app_path)
-    copy_audio_assets(install_dir, progress)
-    if getattr(sys, "frozen", False):
-        emit(progress, f"Installing {INSTALLER_EXE_NAME} to {uninstaller_path}")
-        shutil.copy2(Path(sys.executable), uninstaller_path)
-
-    emit(progress, f"Creating Start Menu shortcuts in {START_MENU_DIR}")
-    START_MENU_DIR.mkdir(parents=True, exist_ok=True)
-    create_shortcut(
-        START_MENU_DIR / f"{APP_DISPLAY_NAME}.lnk",
-        app_path,
-        description=APP_DISPLAY_NAME,
-    )
-    create_shortcut(
-        START_MENU_DIR / f"Uninstall {APP_DISPLAY_NAME}.lnk",
-        uninstaller_path if uninstaller_path.exists() else Path(sys.executable),
-        arguments="--uninstall",
-        description=f"Uninstall {APP_DISPLAY_NAME}",
-    )
-
-    emit(progress, "Configuring Windows startup setting.")
-    set_startup_enabled(startup, app_path)
-    write_auto_update_preference(auto_update, progress)
-    write_uninstall_registry(install_dir, progress)
-
+        emit(progress, "Unmanifested legacy installations and per-user settings were retained.")
     if launch:
-        emit(progress, "Starting SLS Mass Notify.")
-        launch_through_user_shell(app_path, background=launch_background)
+        try:
+            launch_through_user_shell(install_dir / EXE_NAME, background=launch_background)
+        except Exception as exc:
+            # The committed installation remains usable even if Explorer is absent
+            # in a remote management session. This is not an upgrade rollback.
+            emit(progress, f"Installed successfully; start from the Start Menu: {exc}")
     emit(progress, "Installation completed successfully.")
 
 
-def launch_cleanup(install_dir: Path, remove_settings: bool) -> None:
-    install_dir = validate_install_dir(install_dir)
-    cleanup_dir = Path(tempfile.mkdtemp(prefix=f"{APP_SHORT_NAME}_uninstall_"))
-    cleanup_script = cleanup_dir / "finish_uninstall.ps1"
-    parameters_path = cleanup_dir / "parameters.json"
-    parameters_path.write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "install_dir": str(install_dir.resolve()),
-                "install_parent": str(install_dir.resolve().parent),
-                "remove_settings": bool(remove_settings),
-                "config_dir": str(CONFIG_DIR.resolve()),
-                "config_parent": str(CONFIG_DIR.resolve().parent),
-            }
-        ),
-        encoding="utf-8",
-    )
-    cleanup_script.write_text(
-        r'''param([Parameter(Mandatory=$true)][string]$ParametersPath)
-$ErrorActionPreference = "SilentlyContinue"
-$parameters = Get-Content -LiteralPath $ParametersPath -Raw | ConvertFrom-Json
-for ($attempt = 0; $attempt -lt 240; $attempt++) {
-    if (-not (Get-Process -Id ([int]$parameters.pid) -ErrorAction SilentlyContinue)) { break }
-    Start-Sleep -Milliseconds 500
-}
-Remove-Item -LiteralPath ([string]$parameters.install_dir) -Recurse -Force
-if ([bool]$parameters.remove_settings) {
-    Remove-Item -LiteralPath ([string]$parameters.config_dir) -Recurse -Force
-}
-foreach ($parent in @([string]$parameters.install_parent, [string]$parameters.config_parent)) {
-    if ((Test-Path -LiteralPath $parent) -and -not (Get-ChildItem -LiteralPath $parent -Force | Select-Object -First 1)) {
-        Remove-Item -LiteralPath $parent -Force
-    }
-}
-$cleanupRoot = Split-Path -Parent $ParametersPath
-Remove-Item -LiteralPath $cleanupRoot -Recurse -Force
-''',
-        encoding="utf-8",
-    )
-    subprocess.Popen(
-        [
-            str(POWERSHELL_EXE),
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(cleanup_script),
-            "-ParametersPath",
-            str(parameters_path),
-        ],
-        cwd=tempfile.gettempdir(),
-        close_fds=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-
-
 def uninstall_app(
-    *,
-    quiet: bool = False,
-    remove_settings: bool | None = None,
+    *, quiet: bool = False, remove_settings: bool | None = None,
     progress: ProgressCallback | None = None,
-) -> None:
-    install_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else DEFAULT_INSTALL_DIR
-    if remove_settings is None:
-        remove_settings = True
-    if not quiet and progress is None:
-        if not messagebox.askyesno(APP_DISPLAY_NAME, "Uninstall SouthlandServers Mass Notification App?"):
-            return
-        remove_settings = messagebox.askyesno(APP_DISPLAY_NAME, "Remove saved PBX settings and credentials too?")
-
-    emit(progress, "Stopping any running copy of SLS Mass Notify.")
-    stop_running_app()
-    emit(progress, "Removing Windows startup entry.")
-    set_startup_enabled(False, install_dir / EXE_NAME)
-    emit(progress, "Removing Start Menu shortcuts.")
-    for shortcut in (
-        START_MENU_DIR / f"{APP_DISPLAY_NAME}.lnk",
-        START_MENU_DIR / f"Uninstall {APP_DISPLAY_NAME}.lnk",
-    ):
-        try:
-            shortcut.unlink()
-        except OSError:
-            pass
-    try:
-        START_MENU_DIR.rmdir()
-    except OSError:
-        pass
-    emit(progress, "Removing Windows uninstall registry entry.")
-    remove_uninstall_registry()
+) -> bool:
+    """Remove manifest-owned files. Return True only when a reboot is required."""
+    require_admin()
     if remove_settings:
-        emit(progress, "Removing saved PBX credentials from Windows Credential Manager.")
-        for index in range(3):
-            for kind in ("token", "password"):
-                target = f"{CREDENTIAL_TARGET_PREFIX}/pbx-{index + 1}/{kind}"
-                try:
-                    ctypes.windll.advapi32.CredDeleteW(target, 1, 0)
-                except Exception:
-                    pass
-    emit(progress, "Scheduling Program Files cleanup.")
-    launch_cleanup(install_dir, remove_settings)
-    emit(progress, "Uninstall started. The app files will be removed after this window closes.")
-    if not quiet:
-        messagebox.showinfo(APP_DISPLAY_NAME, "Uninstall started. The app files will be removed in a moment.")
+        raise ValueError("Machine uninstall retains each user's settings. Remove them in that user's account before uninstalling.")
+    executable = Path(sys.executable).resolve()
+    install_dir = executable.parent.parent if getattr(sys, "frozen", False) and executable.parent.name == MAINTENANCE_DIR else registered_install_dir()
+    install_dir = validate_install_dir(install_dir)
+    manifest = read_manifest(install_dir)
+    snapshots = validate_shortcut_ownership(manifest)
+    if not quiet and progress is None:
+        if not messagebox.askyesno(APP_DISPLAY_NAME, "Uninstall SouthlandServers Mass Notification App? Per-user settings will be retained."):
+            return False
+    emit(progress, "Requesting a graceful exit from the installed application.")
+    stop_running_app(install_dir, progress)
+    # Verify ALL owned files before removing any of them. Registry/shortcuts
+    # remain available if validation fails or a locked file cannot be scheduled.
+    reboot = remove_exact_files(install_dir, manifest["files"], defer_locked=delete_after_reboot)
+    if reboot:
+        # MoveFileEx directory removal never recurses. Scheduling deepest first
+        # cleans empty owned folders after locked files; unrelated files remain.
+        directories = set()
+        for name in manifest["files"]:
+            parent = (install_dir / name).parent
+            while parent.is_relative_to(install_dir):
+                directories.add(parent)
+                if parent == install_dir:
+                    break
+                parent = parent.parent
+        for directory in sorted(directories, key=lambda value: len(value.parts), reverse=True):
+            if directory.exists():
+                delete_after_reboot(directory)
+    for key, original in snapshots.items():
+        if original is not None:
+            machine_shortcuts()[key].unlink()
+    remove_uninstall_registry()
+    (install_dir / MANIFEST_NAME).unlink()
+    prune_empty(install_dir, list(manifest["files"]))
+    try:
+        install_dir.rmdir()
+    except OSError:
+        pass  # Unowned files and files awaiting reboot are retained.
+    emit(progress, "Uninstall scheduled; restart Windows to remove locked files." if reboot else "Uninstall completed. Per-user settings retained.")
+    return reboot
 
 
 def configure_modern_style(root: Tk) -> None:
@@ -572,23 +618,68 @@ def configure_modern_style(root: Tk) -> None:
     style.configure("Horizontal.TProgressbar", background="#2f81f7", troughcolor="#252b32", borderwidth=0)
 
 
+class SetupOperation:
+    """Run blocking setup work off Tk; dispatch every UI callback on Tk's thread."""
+    def __init__(self, root, progress, finished) -> None:
+        self.root, self.progress, self.finished = root, progress, finished
+        self.events = queue.Queue()
+        self.active = False
+        self.thread = None
+
+    def start(self, work) -> None:
+        if self.active:
+            raise RuntimeError("A setup operation is already running.")
+        self.active = True
+        def run():
+            try:
+                value = work(lambda message: self.events.put(("progress", message)))
+                self.events.put(("done", (value, None)))
+            except Exception as exc:
+                self.events.put(("done", (None, exc)))
+        # A transaction must finish/roll back even if its window is closing.
+        self.thread = threading.Thread(target=run, name="SetupWorker", daemon=False)
+        try:
+            self.thread.start()
+        except Exception:
+            self.active = False
+            raise
+        self.root.after(50, self.poll)
+
+    def poll(self) -> None:
+        for _ in range(32):
+            try:
+                kind, value = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                self.progress(value)
+            else:
+                self.active = False
+                self.finished(*value)
+                return
+        if self.active:
+            self.root.after(50, self.poll)
+
+
 class InstallerWindow:
-    def __init__(self) -> None:
-        self.root = Tk()
+    def __init__(self, root: Tk | None = None) -> None:
+        self.root = root if root is not None else Tk()
         self.root.title(f"{APP_DISPLAY_NAME} Setup")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
+        self.operation = SetupOperation(self.root, self.log, self.install_finished)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
         configure_modern_style(self.root)
         icon = resource_path("favicon.ico")
         if icon.exists():
             try:
-                self.root.iconbitmap(str(icon))
+                self.root.iconbitmap(default=str(icon))
             except Exception:
                 pass
 
-        self.install_dir = StringVar(value=str(DEFAULT_INSTALL_DIR))
-        self.startup = BooleanVar(value=saved_startup_preference())
+        self.install_dir = StringVar(value=str(registered_install_dir()))
+        self.startup = BooleanVar(value=saved_machine_preference("startup_enabled", True))
         self.launch = BooleanVar(value=True)
-        self.auto_update = BooleanVar(value=True)
+        self.auto_update = BooleanVar(value=saved_machine_preference("auto_update_enabled", False))
         self.accept_terms = BooleanVar(value=False)
         self.status = StringVar(value="Ready to install.")
         self.install_button: ttk.Button | None = None
@@ -610,8 +701,11 @@ class InstallerWindow:
             style="HeaderHint.TLabel",
         ).pack(anchor="w", pady=(3, 0))
 
-        frame = ttk.Frame(self.root, padding=(16, 14), style="Page.TFrame")
-        frame.grid(row=1, column=0, sticky="nsew")
+        self.root.rowconfigure(1, weight=1)
+        self.body = ScrollableBody(self.root)
+        self.body.grid(row=1, column=0, sticky="nsew")
+        frame = ttk.Frame(self.body.content, padding=(16, 14), style="Page.TFrame")
+        frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
 
@@ -619,7 +713,7 @@ class InstallerWindow:
         options.grid(row=0, column=0, columnspan=2, sticky="ew")
         options.columnconfigure(0, weight=1)
         ttk.Label(options, text="Install options", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(options, text="Choose the install location and startup preferences.", style="Hint.TLabel").grid(
+        ttk.Label(options, text="Setup closes this installation's app, including stuck background processes.", style="Hint.TLabel").grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(3, 12)
         )
         ttk.Label(options, text="Install folder", style="Hint.TLabel").grid(row=2, column=0, columnspan=3, sticky="w")
@@ -635,7 +729,7 @@ class InstallerWindow:
         )
         ttk.Checkbutton(
             options,
-            text="Automatically install verified GitHub Release updates",
+            text="Download updates for administrator review",
             variable=self.auto_update,
             style="Card.TCheckbutton",
         ).grid(row=6, column=0, columnspan=3, sticky="w")
@@ -678,12 +772,14 @@ class InstallerWindow:
         progress = ttk.Frame(frame, padding=12, style="Card.TFrame")
         progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         progress.columnconfigure(0, weight=1)
-        self.progressbar = ttk.Progressbar(progress, mode="determinate", value=0, maximum=100)
+        self.progressbar = ttk.Progressbar(progress, mode="indeterminate")
         self.progressbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         ttk.Label(progress, textvariable=self.status, style="Status.TLabel").grid(row=1, column=0, sticky="w")
-        actions = ttk.Frame(frame, style="Page.TFrame")
-        actions.grid(row=3, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        self.cancel_button = ttk.Button(actions, text="Cancel", command=self.root.destroy)
+        self.log_box = Text(progress, width=88, height=5, state="disabled", wrap="word", font=("Consolas", 8))
+        self.log_box.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        actions = ttk.Frame(self.root, padding=(16, 10), style="Page.TFrame")
+        actions.grid(row=2, column=0, sticky="e")
+        self.cancel_button = ttk.Button(actions, text="Cancel", command=self.close)
         self.cancel_button.pack(side="left", padx=(0, 8))
         self.install_button = ttk.Button(actions, text="Install now", style="Accent.TButton", command=self.install)
         self.install_button.pack(side="left")
@@ -691,7 +787,7 @@ class InstallerWindow:
 
     def update_install_button_state(self) -> None:
         if self.install_button is not None:
-            self.install_button.configure(state="normal" if self.accept_terms.get() else "disabled")
+            self.install_button.configure(state="normal" if self.accept_terms.get() and not self.operation.active else "disabled")
 
     def log(self, message: str) -> None:
         self.status.set(message)
@@ -703,12 +799,7 @@ class InstallerWindow:
         self.root.update_idletasks()
 
     def _center(self) -> None:
-        self.root.update_idletasks()
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
-        x = max(0, int((self.root.winfo_screenwidth() - width) / 2))
-        y = max(0, int((self.root.winfo_screenheight() - height) / 3))
-        self.root.geometry(f"+{x}+{y}")
+        fit_window(self.root, (850, 760))
 
     def browse(self) -> None:
         selected = filedialog.askdirectory(initialdir=str(PROGRAM_FILES), title="Choose install folder")
@@ -716,11 +807,16 @@ class InstallerWindow:
             self.install_dir.set(selected)
 
     def install(self) -> None:
+        if self.operation.active:
+            return
         try:
             if not self.accept_terms.get():
                 messagebox.showwarning(APP_DISPLAY_NAME, "You must accept the Terms of Service before installing.")
                 return
-            install_dir = validate_install_dir(Path(self.install_dir.get()))
+            # Capture Tk variables here; all validation, file work, subprocesses,
+            # and shutdown waits happen on the worker without touching widgets.
+            install_dir = Path(self.install_dir.get())
+            startup, launch, auto_update = self.startup.get(), self.launch.get(), self.auto_update.get()
             if self.install_button is not None:
                 self.install_button.configure(state="disabled")
             if self.cancel_button is not None:
@@ -728,29 +824,36 @@ class InstallerWindow:
             if self.progressbar is not None:
                 self.progressbar.start(12)
             self.log("Installing...")
-            self.root.update_idletasks()
-            install_app(
+            self.operation.start(lambda report: install_app(
                 install_dir,
-                startup=self.startup.get(),
-                launch=self.launch.get(),
+                startup=startup,
+                launch=launch,
                 remove_legacy=True,
-                auto_update=self.auto_update.get(),
+                auto_update=auto_update,
                 launch_background=False,
-                progress=self.log,
-            )
-            if self.progressbar is not None:
-                self.progressbar.stop()
+                progress=report,
+            ))
+        except Exception as exc:
+            self.install_finished(None, exc)
+
+    def close(self) -> None:
+        if self.operation.active:
+            self.status.set("Setup is still working. Please wait for it to finish before closing.")
+            return
+        self.root.destroy()
+
+    def install_finished(self, _result, error) -> None:
+        if self.progressbar is not None:
+            self.progressbar.stop()
+        if error is None:
             messagebox.showinfo(APP_DISPLAY_NAME, "Installation completed successfully.")
             self.root.destroy()
-        except Exception as exc:
-            if self.progressbar is not None:
-                self.progressbar.stop()
-            if self.install_button is not None:
-                self.install_button.configure(state="normal")
+        else:
+            self.update_install_button_state()
             if self.cancel_button is not None:
                 self.cancel_button.configure(state="normal")
-            self.log("Install failed.")
-            messagebox.showerror(APP_DISPLAY_NAME, f"Installation failed:\n\n{exc}")
+            self.log(f"Installation failed: {error}")
+            messagebox.showerror(APP_DISPLAY_NAME, f"Installation failed:\n\n{error}")
 
     def run(self) -> None:
         self.root.mainloop()
@@ -760,16 +863,18 @@ class UninstallerWindow:
     def __init__(self, *, auto_start: bool = False) -> None:
         self.root = Tk()
         self.root.title(f"{APP_DISPLAY_NAME} Uninstall")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
+        self.operation = SetupOperation(self.root, self.log, self.uninstall_finished)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
         configure_modern_style(self.root)
         icon = resource_path("favicon.ico")
         if icon.exists():
             try:
-                self.root.iconbitmap(str(icon))
+                self.root.iconbitmap(default=str(icon))
             except Exception:
                 pass
 
-        self.remove_settings = BooleanVar(value=True)
+        self.remove_settings = BooleanVar(value=False)
         self.status = StringVar(value="Ready to uninstall.")
         self.uninstall_button: ttk.Button | None = None
         self.cancel_button: ttk.Button | None = None
@@ -789,8 +894,11 @@ class UninstallerWindow:
             anchor="w", pady=(3, 0)
         )
 
-        page = ttk.Frame(self.root, padding=16, style="Page.TFrame")
-        page.grid(row=1, column=0, sticky="nsew")
+        self.root.rowconfigure(1, weight=1)
+        self.body = ScrollableBody(self.root)
+        self.body.grid(row=1, column=0, sticky="nsew")
+        page = ttk.Frame(self.body.content, padding=16, style="Page.TFrame")
+        page.pack(fill="both", expand=True)
         frame = ttk.Frame(page, padding=14, style="Card.TFrame")
         frame.grid(row=0, column=0, sticky="nsew")
         ttk.Label(frame, text="Removal options", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
@@ -802,7 +910,8 @@ class UninstallerWindow:
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 12))
         ttk.Checkbutton(
             frame,
-            text="Remove saved PBX settings and credentials",
+            text="Per-user PBX settings and credentials are retained",
+            state="disabled",
             variable=self.remove_settings,
             style="Card.TCheckbutton",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 12))
@@ -828,7 +937,7 @@ class UninstallerWindow:
         )
         self.log_box.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 14))
         ttk.Label(frame, textvariable=self.status, style="Status.TLabel").grid(row=6, column=0, sticky="w")
-        self.cancel_button = ttk.Button(frame, text="Cancel", command=self.root.destroy)
+        self.cancel_button = ttk.Button(frame, text="Cancel", command=self.close)
         self.cancel_button.grid(row=6, column=1, sticky="e", padx=(0, 8))
         self.uninstall_button = ttk.Button(frame, text="Uninstall", style="Accent.TButton", command=self.uninstall)
         self.uninstall_button.grid(row=6, column=2, sticky="e")
@@ -836,12 +945,7 @@ class UninstallerWindow:
             self.uninstall_button.configure(state="disabled")
 
     def _center(self) -> None:
-        self.root.update_idletasks()
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
-        x = max(0, int((self.root.winfo_screenwidth() - width) / 2))
-        y = max(0, int((self.root.winfo_screenheight() - height) / 3))
-        self.root.geometry(f"+{x}+{y}")
+        fit_window(self.root, (850, 760))
 
     def log(self, message: str) -> None:
         self.status.set(message)
@@ -853,74 +957,110 @@ class UninstallerWindow:
         self.root.update_idletasks()
 
     def uninstall(self) -> None:
+        if self.operation.active:
+            return
         try:
+            remove_settings = self.remove_settings.get()
             if self.uninstall_button is not None:
                 self.uninstall_button.configure(state="disabled")
             if self.cancel_button is not None:
                 self.cancel_button.configure(state="disabled")
             if self.progressbar is not None:
                 self.progressbar.start(12)
-            uninstall_app(
+            self.operation.start(lambda report: uninstall_app(
                 quiet=True,
-                remove_settings=self.remove_settings.get(),
-                progress=self.log,
-            )
-            if self.progressbar is not None:
-                self.progressbar.stop()
+                remove_settings=remove_settings,
+                progress=report,
+            ))
+        except Exception as exc:
+            self.uninstall_finished(None, exc)
+
+    def close(self) -> None:
+        if self.operation.active:
+            self.status.set("Uninstall is still working. Please wait for it to finish before closing.")
+            return
+        self.root.destroy()
+
+    def uninstall_finished(self, reboot, error) -> None:
+        if self.progressbar is not None:
+            self.progressbar.stop()
+        if error is None:
             messagebox.showinfo(
                 APP_DISPLAY_NAME,
-                "Uninstall started. The app files will be removed after this window closes.",
+                "Uninstall finished. " + ("Restart Windows to remove locked files. " if reboot else "")
+                + "Per-user settings were retained.",
             )
             self.root.destroy()
-        except Exception as exc:
-            if self.progressbar is not None:
-                self.progressbar.stop()
+        else:
             if self.uninstall_button is not None:
                 self.uninstall_button.configure(state="normal")
             if self.cancel_button is not None:
                 self.cancel_button.configure(state="normal")
-            self.log("Uninstall failed.")
-            messagebox.showerror(APP_DISPLAY_NAME, f"Uninstall failed:\n\n{exc}")
+            self.log(f"Uninstall failed: {error}")
+            messagebox.showerror(APP_DISPLAY_NAME, f"Uninstall failed:\n\n{error}")
 
     def run(self) -> None:
         self.root.mainloop()
 
 
-def main() -> None:
+def main() -> int:
     if os.name != "nt":
         print("This installer is for Windows only.")
-        return
-
-    quiet = "--quiet" in sys.argv
-    if "--uninstall" in sys.argv:
-        if not is_admin() and relaunch_as_admin():
-            return
-        UninstallerWindow(auto_start=quiet).run()
-        return
-
-    if "--silent" in sys.argv:
-        if not is_admin() and relaunch_as_admin():
-            return
-        requested_install_dir = command_line_value("--install-dir")
-        install_dir = validate_install_dir(Path(requested_install_dir) if requested_install_dir else DEFAULT_INSTALL_DIR)
-        install_app(
-            install_dir,
-            startup=saved_startup_preference(),
-            launch=True,
-            remove_legacy=True,
-            auto_update=None,
-            launch_background="--update" in sys.argv,
-        )
-        return
-
-    if not is_admin():
-        if relaunch_as_admin():
-            return
-        messagebox.showerror(APP_DISPLAY_NAME, "Administrator permission is required to install to Program Files.")
-        return
-
-    InstallerWindow().run()
+        return 1633
+    check_ui = "--check-ui" in sys.argv
+    quiet = "--quiet" in sys.argv or "--silent" in sys.argv or check_ui
+    try:
+        if check_ui:
+            # Packaging smoke test: construct the actual hidden setup window,
+            # without elevation, installation, registry writes, or app launch.
+            root = Tk()
+            root.withdraw()
+            try:
+                InstallerWindow(root)
+                root.update_idletasks()
+            finally:
+                root.destroy()
+            return 0
+        if not is_admin():
+            if quiet:
+                # Management agents require a deterministic failure, not a UAC
+                # prompt, detached child process, or an apparent success.
+                raise ElevationRequired("Silent setup requires an elevated administrator session.")
+            if relaunch_as_admin():
+                return 0
+            raise ElevationRequired("Administrator elevation was declined or failed.")
+        if "--uninstall" in sys.argv:
+            if quiet:
+                return 3010 if uninstall_app(quiet=True, remove_settings="--remove-settings" in sys.argv) else 0
+            UninstallerWindow().run()
+            return 0
+        if quiet:
+            if "--accept-terms" not in sys.argv and "--update" not in sys.argv:
+                raise ValueError("Silent installation requires --accept-terms.")
+            requested = command_line_value("--install-dir")
+            startup_value = command_line_value("--startup")
+            update_value = command_line_value("--auto-update")
+            for value in (startup_value, update_value):
+                if value not in ("", "on", "off"):
+                    raise ValueError("--startup and --auto-update accept on or off.")
+            install_app(
+                Path(requested) if requested else registered_install_dir(),
+                startup=None if not startup_value else startup_value == "on",
+                launch="--launch" in sys.argv, remove_legacy=False,
+                auto_update=None if not update_value else update_value == "on",
+                launch_background="--update" in sys.argv,
+            )
+            return 0
+        InstallerWindow().run()
+        return 0
+    except Exception as exc:
+        if quiet:
+            if sys.stderr is not None:
+                print(f"Setup failed: {exc}", file=sys.stderr)
+        else:
+            messagebox.showerror(APP_DISPLAY_NAME, f"Setup failed: {exc}")
+        return 740 if isinstance(exc, ElevationRequired) else 1603
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

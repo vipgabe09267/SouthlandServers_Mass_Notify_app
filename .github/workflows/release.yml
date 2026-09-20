@@ -1,0 +1,37 @@
+name: Build signed release for review
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  signed-package:
+    # Provision this restricted signing runner and protect the signing environment
+    # before enabling. Pull-request code must never execute on the signing runner.
+    if: github.ref == 'refs/heads/main'
+    environment: release-signing
+    runs-on: [self-hosted, Windows, X64, sls-signing]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate and sign
+        shell: powershell
+        env:
+          SLS_PYTHON: ${{ vars.SLS_PYTHON }}
+          SLS_SIGNTOOL: ${{ vars.SLS_SIGNTOOL }}
+          SLS_SIGN_CERT: ${{ vars.SLS_SIGN_CERT }}
+          SLS_SIGNER_SHA256: ${{ vars.SLS_SIGNER_SHA256 }}
+          SLS_TIMESTAMP_URL: ${{ vars.SLS_TIMESTAMP_URL }}
+        run: |
+          & $env:SLS_PYTHON tools/audit_build_dependencies.py
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency audit failed.' }
+          ./build-installer.ps1 -Clean -Release -PythonExecutable $env:SLS_PYTHON -SignTool $env:SLS_SIGNTOOL -CertificateThumbprint $env:SLS_SIGN_CERT -TrustedSignerSha256 $env:SLS_SIGNER_SHA256 -TimestampUrl $env:SLS_TIMESTAMP_URL
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-release-for-review
+          path: |
+            dist/packages/SLS_Mass_Notify_Installer.zip
+            dist/packages/SLS_Mass_Notify_Installer.zip.sha256
+          retention-days: 14
+          if-no-files-found: error

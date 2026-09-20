@@ -1,4 +1,6 @@
 .venv/
+.venv-build/
+.tools/
 build/
 dist/
 *.spec

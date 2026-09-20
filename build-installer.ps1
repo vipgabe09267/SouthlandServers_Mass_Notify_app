@@ -1,59 +1,59 @@
 param(
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$Release,
+    [string]$PythonExecutable = '',
+    [string]$SignTool = '',
+    [string]$CertificateThumbprint = '',
+    [string]$TrustedSignerSha256 = '',
+    [string]$TimestampUrl = ''
 )
 
-$ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $ProjectRoot
-
-Write-Host "Building main application exe..." -ForegroundColor Green
-& "$ProjectRoot\build.ps1" -Clean:$Clean
-
-$AppExe = "$ProjectRoot\dist\SLS_Mass_Notify.exe"
-if (-not (Test-Path $AppExe)) {
-    throw "Failed to build SLS_Mass_Notify.exe"
+. (Join-Path $ProjectRoot 'build-common.ps1')
+Set-Location -LiteralPath $ProjectRoot
+$buildArgs = @{ Clean=$Clean; Release=$Release; PythonExecutable=$PythonExecutable; SignTool=$SignTool; CertificateThumbprint=$CertificateThumbprint; TrustedSignerSha256=$TrustedSignerSha256; TimestampUrl=$TimestampUrl }
+& (Join-Path $ProjectRoot 'build.ps1') @buildArgs
+$buildPython = Join-Path $ProjectRoot '.venv-build\Scripts\python.exe'
+$appDirectory = Join-Path $ProjectRoot 'dist\SLS_Mass_Notify'
+Invoke-NativeChecked -Executable $buildPython -Arguments @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed', '--noupx', '--distpath', 'build/installer-payload', '--name', 'SLS_Mass_Notify_Installer', '--icon', 'favicon.ico', '--version-file', 'version_info_installer.txt', '--add-data', "$appDirectory;SLS_Mass_Notify", '--add-data', 'favicon.ico;.', '--add-data', 'audio;audio', 'sls_installer.py')
+$installerDirectory = Join-Path $ProjectRoot 'build\installer-payload\SLS_Mass_Notify_Installer'
+$installerExe = Join-Path $installerDirectory 'SLS_Mass_Notify_Installer.exe'
+if (-not (Test-Path -LiteralPath $installerExe -PathType Leaf)) { throw 'Installer output was not created.' }
+if ($Release) {
+    Sign-ReleaseExecutable -Path $installerExe -SignTool $SignTool -CertificateThumbprint $CertificateThumbprint -TrustedSignerSha256 $TrustedSignerSha256 -TimestampUrl $TimestampUrl
 }
-Write-Host "Main exe built successfully." -ForegroundColor Green
-
-$PythonBase = (& py -3.13 -c "import sys; print(sys.base_prefix)").Trim()
-$env:TCL_LIBRARY = Join-Path $PythonBase "tcl\tcl8.6"
-$env:TK_LIBRARY = Join-Path $PythonBase "tcl\tk8.6"
-
-if (-not (Test-Path "$ProjectRoot\.venv")) {
-    py -3.13 -m venv .venv
+Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/write_build_inventory.py', 'build/installer-payload/SLS_Mass_Notify_Installer')
+Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/build_setup_bootstrap.py')
+$bootstrap = Join-Path $ProjectRoot 'dist\SLS_Mass_Notify_Installer.exe'
+if ($Release) {
+    Sign-ReleaseExecutable -Path $bootstrap -SignTool $SignTool -CertificateThumbprint $CertificateThumbprint -TrustedSignerSha256 $TrustedSignerSha256 -TimestampUrl $TimestampUrl
 }
-
-& "$ProjectRoot\.venv\Scripts\python.exe" -m pip install --upgrade pip
-& "$ProjectRoot\.venv\Scripts\python.exe" -m pip install -r requirements-build.txt
-
-Write-Host ""
-Write-Host "Building Program Files installer exe..." -ForegroundColor Green
-& "$ProjectRoot\.venv\Scripts\python.exe" -m PyInstaller `
-    --noconfirm `
-    --clean `
-    --onefile `
-    --windowed `
-    --name SLS_Mass_Notify_Installer `
-    --icon "$ProjectRoot\favicon.ico" `
-    --version-file "$ProjectRoot\version_info_installer.txt" `
-    --add-data "$AppExe;." `
-    --add-data "$ProjectRoot\favicon.ico;." `
-    --add-data "$ProjectRoot\audio;audio" `
-    "$ProjectRoot\sls_installer.py"
-
-if ($LASTEXITCODE -ne 0) {
-    throw "Installer PyInstaller build failed with exit code $LASTEXITCODE"
+# Retire the old loose Python installer bundle; users launch the self-contained
+# bootstrap now. This helper checks the workspace boundary and reparse points.
+Remove-BuildDirectory -Root $ProjectRoot -Name 'dist\SLS_Mass_Notify_Installer'
+Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/verify_build_artifacts.py')
+Invoke-NativeChecked -Executable $buildPython -Arguments @('tools/smoke_setup_runtime.py', '--full-payload')
+$packageItems = @($bootstrap)
+$packageDirectory = Join-Path $ProjectRoot 'dist\packages'
+New-Item -ItemType Directory -Force -Path $packageDirectory | Out-Null
+if ($Release) {
+    # The bootstrap's signature covers its embedded runtime and application.
+    $catalog = Join-Path $packageDirectory 'SLS_Mass_Notify_Installer.cat'
+    New-FileCatalog -Path $bootstrap -CatalogFilePath $catalog -CatalogVersion 2.0 | Out-Null
+    Sign-ReleaseExecutable -Path $catalog -SignTool $SignTool -CertificateThumbprint $CertificateThumbprint -TrustedSignerSha256 $TrustedSignerSha256 -TimestampUrl $TimestampUrl
+    if ((Test-FileCatalog -Path $bootstrap -CatalogFilePath $catalog) -ne 'Valid') {
+        throw 'Installer catalog verification failed.'
+    }
+    $packageItems += $catalog
 }
-
-$InstallerExe = "$ProjectRoot\dist\SLS_Mass_Notify_Installer.exe"
-if (-not (Test-Path $InstallerExe)) {
-    throw "Installer output was not created: $InstallerExe"
+$archive = Join-Path $packageDirectory 'SLS_Mass_Notify_Installer.zip'
+Compress-Archive -LiteralPath $packageItems -DestinationPath $archive -Force
+$digest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+[IO.File]::WriteAllText($archive + '.sha256', "$digest  SLS_Mass_Notify_Installer.zip`n")
+# Retire only the old generated top-level packaging files, even without -Clean.
+foreach ($oldName in @('README.txt', 'SLS_Mass_Notify_Installer.zip', 'SLS_Mass_Notify_Installer.zip.sha256', 'SLS_Mass_Notify_Installer.cat')) {
+    $oldPath = Join-Path (Join-Path $ProjectRoot 'dist') $oldName
+    if (Test-Path -LiteralPath $oldPath -PathType Leaf) { Remove-Item -LiteralPath $oldPath -Force }
 }
-
-Write-Host ""
-Write-Host "Installer built successfully." -ForegroundColor Green
-Write-Host "Installer location:" -ForegroundColor Cyan
-Write-Host "  $InstallerExe" -ForegroundColor White
-Write-Host ""
-Write-Host "The installer requests Administrator permission, installs to Program Files,"
-Write-Host "adds Start Menu shortcuts, registers uninstall, and opens Settings after install."
+if (-not $Release) { Write-Warning 'Development package is unsigned. Do not publish it or use it for production deployment.' }
+Write-Host "Built installer package: $archive"
