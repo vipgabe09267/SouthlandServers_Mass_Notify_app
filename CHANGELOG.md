@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.6-beta - 2026-09-20
+## 1.0.9-beta - 2026-09-21
 
 Changes since 1.0.8-beta:
 

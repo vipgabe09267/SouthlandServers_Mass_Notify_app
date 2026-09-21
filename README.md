@@ -2,7 +2,7 @@
 
 Windows desktop notifications for the Southland Servers FreePBX module.
 
-**[Download 1.1.6-beta](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases/download/v1.1.6-beta/SLS_Mass_Notify_Installer.exe)** | [Changelog](CHANGELOG.md)
+**[Download 1.0.9-beta](https://github.com/vipgabe09267/SouthlandServers_Mass_Notify_app/releases/download/v1.0.9-beta/SLS_Mass_Notify_Installer.exe)** | [Changelog](CHANGELOG.md)
 
 ## Install
 
