@@ -27,7 +27,7 @@ jobs:
           & $env:SLS_PYTHON tools/audit_build_dependencies.py
           if ($LASTEXITCODE -ne 0) { throw 'Dependency audit failed.' }
           ./build-installer.ps1 -Clean -Release -PythonExecutable $env:SLS_PYTHON -SignTool $env:SLS_SIGNTOOL -CertificateThumbprint $env:SLS_SIGN_CERT -TrustedSignerSha256 $env:SLS_SIGNER_SHA256 -TimestampUrl $env:SLS_TIMESTAMP_URL
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signed-release-for-review
           path: |
